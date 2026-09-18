@@ -14,7 +14,7 @@ func runGC(ctx context.Context, env Env) error {
 	fs.SetOutput(env.Stderr)
 	dryRun := fs.Bool("dry-run", false, "report what would change without modifying the registry")
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci gc [flags] <oci-url>
+		diag(env.Stderr, `usage: git-remote-oci gc [flags] <oci-url>
 
 Compacts a repository stored in an OCI registry.
 
@@ -54,7 +54,7 @@ Flags:
 		repo = nil
 	}
 
-	logf := func(format string, a ...any) { fmt.Fprintf(env.Stderr, format, a...) }
+	logf := func(format string, a ...any) { diag(env.Stderr, format, a...) }
 	result, err := gc.Run(ctx, client, repo, gc.Options{DryRun: *dryRun, Logf: logf})
 	if err != nil {
 		return err
@@ -64,9 +64,8 @@ Flags:
 	if *dryRun {
 		verb = "would remove"
 	}
-	fmt.Fprintf(env.Stdout,
+	return printf(env.Stdout,
 		"repacked %d refs; %s %d commit manifests and %d lock tags (%d tags -> %d)\n",
 		result.RefsConsolidated, verb, result.CommitTagsPruned, result.LockTagsPruned,
 		result.TagsBefore, result.TagsAfter)
-	return nil
 }

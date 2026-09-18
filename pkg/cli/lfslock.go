@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"sort"
@@ -28,7 +29,7 @@ func runLFSLock(ctx context.Context, env Env) error {
 	fs.SetOutput(env.Stderr)
 	owner := fs.String("owner", "", "lock owner to record (default: $USER@$HOSTNAME)")
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci lfs-lock [flags] <oci-url> <path>
+		diag(env.Stderr, `usage: git-remote-oci lfs-lock [flags] <oci-url> <path>
 
 Takes a Git LFS file lock on <path>.
 
@@ -58,10 +59,20 @@ Flags:
 	path := fs.Arg(1)
 
 	lock, err := client.AcquireLFSLock(ctx, path, *owner)
-	if err != nil {
+	if lock == nil && err != nil {
 		return fmt.Errorf("failed to lock %s: %w", path, err)
 	}
-	fmt.Fprintf(env.Stdout, "locked %s (id %s, owner %s)\n", lock.Path, lock.ID, lock.Owner.Name)
+	if printErr := printf(env.Stdout, "locked %s (id %s, owner %s)\n", lock.Path, lock.ID, lock.Owner.Name); printErr != nil {
+		// The lock is published either way; say so, and say whatever else
+		// went wrong after it, rather than letting one failure hide the other.
+		return errors.Join(printErr, err)
+	}
+	if err != nil {
+		// The lock was published; what failed afterwards was giving back the
+		// index lock that protected the list. Say both, because the second
+		// part leaves other lock operations waiting until it expires.
+		return fmt.Errorf("locked %s, but: %w", path, err)
+	}
 	return nil
 }
 
@@ -70,7 +81,7 @@ func runLFSLocks(ctx context.Context, env Env) error {
 	fs := flag.NewFlagSet("lfs-locks", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci lfs-locks <oci-url>
+		diag(env.Stderr, `usage: git-remote-oci lfs-locks <oci-url>
 
 Lists the Git LFS file locks held in a repository.
 `)
@@ -93,15 +104,18 @@ Lists the Git LFS file locks held in a repository.
 		return fmt.Errorf("failed to read the locks: %w", err)
 	}
 	if len(locks) == 0 {
-		fmt.Fprintln(env.Stdout, "no locks held")
-		return nil
+		return printf(env.Stdout, "no locks held\n")
 	}
 	sort.Slice(locks, func(i, j int) bool { return locks[i].Path < locks[j].Path })
 
 	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "PATH\tOWNER\tLOCKED AT\tID")
+	if err := printf(w, "PATH\tOWNER\tLOCKED AT\tID\n"); err != nil {
+		return err
+	}
 	for _, l := range locks {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", l.Path, l.Owner.Name, l.LockedAt.Format("2006-01-02 15:04:05Z07:00"), l.ID)
+		if err := printf(w, "%s\t%s\t%s\t%s\n", l.Path, l.Owner.Name, l.LockedAt.Format("2006-01-02 15:04:05Z07:00"), l.ID); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }
@@ -113,7 +127,7 @@ func runLFSUnlock(ctx context.Context, env Env) error {
 	force := fs.Bool("force", false, "release a lock held by someone else")
 	owner := fs.String("owner", "", "owner to release as (default: $USER@$HOSTNAME)")
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci lfs-unlock [flags] <oci-url> <path-or-id>
+		diag(env.Stderr, `usage: git-remote-oci lfs-unlock [flags] <oci-url> <path-or-id>
 
 Releases a Git LFS file lock, named by the locked path or by its lock id.
 
@@ -146,17 +160,23 @@ Flags:
 		return fmt.Errorf("failed to look up %s: %w", target, err)
 	} else if byPath != nil {
 		lockID = byPath.ID
-		fmt.Fprintf(env.Stderr, "git-remote-oci: %s is locked as %s\n", target, lockID)
+		diag(env.Stderr, "git-remote-oci: %s is locked as %s\n", target, lockID)
 	}
 
 	released, err := client.ReleaseLFSLock(ctx, lockID, *force, *owner)
-	if err != nil {
+	if released == nil && err != nil {
 		return fmt.Errorf("failed to unlock %s: %w", target, err)
 	}
 	if released == nil {
-		fmt.Fprintf(env.Stdout, "no lock matched %s\n", target)
-		return nil
+		return printf(env.Stdout, "no lock matched %s\n", target)
 	}
-	fmt.Fprintf(env.Stdout, "unlocked %s (id %s)\n", released.Path, released.ID)
+	if printErr := printf(env.Stdout, "unlocked %s (id %s)\n", released.Path, released.ID); printErr != nil {
+		return errors.Join(printErr, err)
+	}
+	if err != nil {
+		// Same as lfs-lock: the release itself landed; the index lock did not
+		// come back.
+		return fmt.Errorf("unlocked %s, but: %w", target, err)
+	}
 	return nil
 }
