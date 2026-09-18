@@ -38,6 +38,11 @@ import (
 
 // Registry is an in-process OCI registry with enough behaviour for a push, a
 // fetch, a garbage collection and an fsck.
+//
+// It is strict where a real registry is strict: a blob upload whose bytes do
+// not hash to the digest the client claimed is rejected with 400, so a client
+// that would publish content under the wrong address fails here rather than
+// only against a hosted registry.
 type Registry struct {
 	mu        sync.Mutex
 	blobs     map[string][]byte
@@ -46,6 +51,8 @@ type Registry struct {
 	tags      []string
 
 	// RefuseDelete models GHCR and friends, which restrict manifest deletion.
+	// Set it before Serve; a registry that changes its mind mid-test answers
+	// the DELETE from an Intercept hook instead.
 	RefuseDelete bool
 
 	// server is the httptest server this registry is being served on, so a
@@ -69,6 +76,11 @@ type Registry struct {
 	//
 	// Like observe it runs without r.mu held.
 	intercept func(w http.ResponseWriter, req *http.Request) bool
+
+	// requests records "METHOD path" for every request served, in order, so
+	// a test can assert that something did *not* happen -- a dry run that
+	// issued no DELETE, a size question answered without a packfile download.
+	requests []string
 
 	deleted []string
 }
@@ -112,6 +124,7 @@ func (r *Registry) handle(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Path
 
 	r.mu.Lock()
+	r.requests = append(r.requests, req.Method+" "+path)
 	hook, intercept := r.observe, r.intercept
 	r.mu.Unlock()
 	if hook != nil {
@@ -136,8 +149,24 @@ func (r *Registry) handle(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 
 	case req.Method == http.MethodPut && strings.Contains(path, "/blobs/uploads/"):
-		data, _ := io.ReadAll(req.Body)
-		r.blobs[req.URL.Query().Get("digest")] = data
+		// A conformant registry verifies that the uploaded bytes hash to the
+		// digest the client claimed and rejects the upload otherwise. Without
+		// that the fake stores a blob under a digest that does not describe
+		// it, which is exactly the bug the client has to be shown not to
+		// produce -- a lax fake makes a corrupting writer look correct.
+		digest := req.URL.Query().Get("digest")
+		data, err := io.ReadAll(req.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if digest == "" || Digest(data) != digest {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"errors":[{"code":"DIGEST_INVALID","message":"provided digest did not match uploaded content"}]}`))
+			return
+		}
+		r.blobs[digest] = data
 		w.WriteHeader(http.StatusCreated)
 
 	case req.Method == http.MethodHead && strings.Contains(path, "/blobs/"):
@@ -241,6 +270,36 @@ func (r *Registry) Deletions() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.deleted...)
+}
+
+// Requests returns every request served so far as "METHOD path", oldest
+// first. A test that cares only about one operation takes the length before
+// it and slices from there.
+func (r *Registry) Requests() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.requests...)
+}
+
+// HasBlob reports whether a blob is stored under digest.
+func (r *Registry) HasBlob(digest string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.blobs[digest]
+	return ok
+}
+
+// ManifestBytes returns the stored bytes for a tag, and whether the tag
+// exists. It is RawManifest for the cases where absence is an answer rather
+// than a failure -- a ref that was never published, or one that was deleted.
+func (r *Registry) ManifestBytes(tag string) ([]byte, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, ok := r.manifests[tag]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), raw...), true
 }
 
 // Blobs returns a copy of the stored blob contents.

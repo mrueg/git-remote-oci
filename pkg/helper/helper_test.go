@@ -5,204 +5,21 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/helper"
 
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
-	opencontainers "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
-
-type mockRegistry struct {
-	mu        sync.Mutex
-	blobs     map[string][]byte
-	manifests map[string][]byte
-	// byDigest retains every manifest ever pushed, keyed by digest. A real
-	// registry keeps a manifest addressable by digest after its tag moves on;
-	// without that, re-tagging a superseded manifest - which is how an atomic
-	// push rolls back - cannot work.
-	byDigest map[string][]byte
-	tags     []string
-	// intercept, when set, runs before any normal handling. Returning true
-	// means it wrote the response itself and the default path is skipped.
-	//
-	// It is called without m.mu held, so it must not touch the maps above.
-	intercept func(w http.ResponseWriter, r *http.Request) bool
-	// requests records "METHOD path" for every request served, so tests can
-	// assert that something did *not* happen.
-	requests []string
-}
-
-func newMockRegistry() *mockRegistry {
-	return &mockRegistry{
-		blobs:     make(map[string][]byte),
-		manifests: make(map[string][]byte),
-		byDigest:  make(map[string][]byte),
-	}
-}
-
-func (m *mockRegistry) Server() *httptest.Server {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-
-		m.mu.Lock()
-		m.requests = append(m.requests, r.Method+" "+path)
-		hook := m.intercept
-		m.mu.Unlock()
-
-		if hook != nil && hook(w, r) {
-			return
-		}
-
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		if path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if strings.HasSuffix(path, "/tags/list") {
-			resp := map[string]any{
-				"name": "test-repo",
-				"tags": m.tags,
-			}
-			_ = json.NewEncoder(w).Encode(resp)
-			return
-		}
-
-		if r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/") {
-			w.Header().Set("Location", "/v2/test-repo/blobs/uploads/session-1")
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-
-		if r.Method == http.MethodPut && strings.Contains(path, "/blobs/uploads/") {
-			digest := r.URL.Query().Get("digest")
-			data, _ := io.ReadAll(r.Body)
-			m.blobs[digest] = data
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-
-		if r.Method == http.MethodGet && strings.Contains(path, "/blobs/") {
-			parts := strings.Split(path, "/blobs/")
-			digest := parts[len(parts)-1]
-			if data, ok := m.blobs[digest]; ok {
-				w.Header().Set("Content-Type", "application/octet-stream")
-				_, _ = w.Write(data)
-				return
-			}
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		if r.Method == http.MethodPut && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			data, _ := io.ReadAll(r.Body)
-			m.manifests[ref] = data
-			m.byDigest[opencontainers.FromBytes(data).String()] = data
-
-			found := false
-			for _, t := range m.tags {
-				if t == ref {
-					found = true
-					break
-				}
-			}
-			if !found {
-				m.tags = append(m.tags, ref)
-			}
-
-			digest := opencontainers.FromBytes(data).String()
-			w.Header().Set("Docker-Content-Digest", digest)
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-
-		// HEAD is how ORAS resolves a tag to a descriptor. Without it, every
-		// Resolve fails as "not found" and deletions silently no-op.
-		if r.Method == http.MethodHead && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			data, ok := m.manifests[ref]
-			if !ok {
-				data, ok = m.byDigest[ref]
-			}
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-			w.Header().Set("Docker-Content-Digest", opencontainers.FromBytes(data).String())
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if r.Method == http.MethodDelete && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-
-			// The reference may be a tag or a digest; drop both the tag entry
-			// and any tag whose manifest has the requested digest.
-			deleted := false
-			for tag, data := range m.manifests {
-				if tag == ref || opencontainers.FromBytes(data).String() == ref {
-					delete(m.manifests, tag)
-					m.tags = slices.DeleteFunc(m.tags, func(t string) bool { return t == tag })
-					deleted = true
-				}
-			}
-			if !deleted {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-
-		if r.Method == http.MethodGet && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			data, ok := m.manifests[ref]
-			if !ok {
-				data, ok = m.byDigest[ref]
-			}
-			if ok {
-				w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-				w.Header().Set("Docker-Content-Digest", opencontainers.FromBytes(data).String())
-				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-				_, _ = w.Write(data)
-				return
-			}
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		w.WriteHeader(http.StatusNotFound)
-	})
-
-	return httptest.NewServer(mux)
-}
 
 func TestHelperEndToEnd(t *testing.T) {
 	// 1. Create temporary directory for source repo
@@ -240,10 +57,9 @@ func TestHelperEndToEnd(t *testing.T) {
 		t.Fatalf("Failed to commit: %v", err)
 	}
 
-	// 2. Start mock registry
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	// 2. Start the registry
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	ociURL := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 
@@ -1003,9 +819,8 @@ func TestOptionFilterAndDepth(t *testing.T) {
 // merely grepping the capabilities banner, which is what the previous version
 // of this test did - it never invoked the filter at all.
 func TestRefPrefixFiltersListOutput(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -1033,9 +848,8 @@ func TestRefPrefixFiltersListOutput(t *testing.T) {
 // TestRefPrefixSurvivesRepeatedList: the prefix filter used to be cleared after
 // the first list, so a second list in the same session came back unfiltered.
 func TestRefPrefixSurvivesRepeatedList(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"

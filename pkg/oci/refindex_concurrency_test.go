@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -23,26 +24,18 @@ const (
 // competing writer can slip past that lock — it is advisory, and a registry has
 // no compare-and-swap — so a test that acquires it properly could not reproduce
 // the race at all; it would just block until the wait expired.
-func captureRefIndex(t *testing.T, reg *mockRegistry, client *oci.Client, refs map[string]oci.RefEntry) []byte {
+func captureRefIndex(t *testing.T, reg *registrytest.Registry, client *oci.Client, refs map[string]oci.RefEntry) []byte {
 	t.Helper()
 
 	if err := client.PushRichRefIndex(context.Background(), refs, nil); err != nil {
 		t.Fatalf("PushRichRefIndex: %v", err)
 	}
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	raw, ok := reg.manifests[oci.TagRefIndex]
-	if !ok {
-		t.Fatal("no _refs manifest was stored")
-	}
-	return append([]byte(nil), raw...)
+	return reg.RawManifest(t, oci.TagRefIndex)
 }
 
 // setRefIndex replaces the published _refs manifest without taking the lock.
-func setRefIndex(reg *mockRegistry, raw []byte) {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	reg.manifests[oci.TagRefIndex] = append([]byte(nil), raw...)
+func setRefIndex(reg *registrytest.Registry, raw []byte) {
+	reg.PutManifest(oci.TagRefIndex, raw)
 }
 
 // TestRefIndexUpdateDetectsAConcurrentWriter pins the optimistic-concurrency
@@ -55,11 +48,10 @@ func setRefIndex(reg *mockRegistry, raw []byte) {
 // Here another writer lands *while* this one is merging. It must be noticed and
 // the merge redone against the new state.
 func TestRefIndexUpdateDetectsAConcurrentWriter(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	before := captureRefIndex(t, reg, client, map[string]oci.RefEntry{
@@ -74,25 +66,20 @@ func TestRefIndexUpdateDetectsAConcurrentWriter(t *testing.T) {
 	// the index during its merge.
 	setRefIndex(reg, before)
 	var fired atomic.Bool
-	reg.mu.Lock()
-	reg.intercept = func(_ http.ResponseWriter, r *http.Request) bool {
-		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.TagRefIndex) {
+	reg.Observe(func(method, path string) {
+		if method == http.MethodGet && strings.HasSuffix(path, "/manifests/"+oci.TagRefIndex) {
 			if fired.CompareAndSwap(false, true) {
 				setRefIndex(reg, after)
 			}
 		}
-		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	client.ClearManifestCache()
 	if err := client.PushRichRefIndex(ctx, map[string]oci.RefEntry{"refs/heads/mine": {SHA: shaC}}, nil); err != nil {
 		t.Fatalf("push under contention failed: %v", err)
 	}
 
-	reg.mu.Lock()
-	reg.intercept = nil
-	reg.mu.Unlock()
+	reg.Observe(nil)
 	client.ClearManifestCache()
 
 	final, err := client.FetchRichRefIndex(ctx)
@@ -120,11 +107,10 @@ func TestRefIndexUpdateDetectsAConcurrentWriter(t *testing.T) {
 // TestRefIndexUpdateReportsPersistentContention pins that losing repeatedly is
 // reported rather than silently dropped.
 func TestRefIndexUpdateReportsPersistentContention(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	// A distinct index state for every read the push will perform. Alternating
@@ -139,15 +125,12 @@ func TestRefIndexUpdateReportsPersistentContention(t *testing.T) {
 
 	setRefIndex(reg, states[0])
 	var seq atomic.Int32
-	reg.mu.Lock()
-	reg.intercept = func(_ http.ResponseWriter, r *http.Request) bool {
-		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.TagRefIndex) {
+	reg.Observe(func(method, path string) {
+		if method == http.MethodGet && strings.HasSuffix(path, "/manifests/"+oci.TagRefIndex) {
 			next := int(seq.Add(1))
 			setRefIndex(reg, states[next%len(states)])
 		}
-		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	client.ClearManifestCache()
 	err := client.PushRichRefIndex(ctx, map[string]oci.RefEntry{"refs/heads/mine": {SHA: shaC}}, nil)

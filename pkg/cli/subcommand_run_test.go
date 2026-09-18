@@ -1,45 +1,27 @@
 package cli_test
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
 // The dispatch tests cover which subcommand runs. These cover what the
 // subcommands then do: until now nothing invoked fsck, break-lock or the lfs-*
 // bodies at all, only their argument checks.
 
-// emptyRegistry answers like a registry hosting a repository that exists but
-// holds nothing: no tags, no manifests.
-func emptyRegistry(t *testing.T) *httptest.Server {
+// emptyRegistry is the oci:// URL of a registry hosting a repository that
+// exists but holds nothing: no tags, no manifests.
+func emptyRegistry(t *testing.T) string {
 	t.Helper()
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v2/":
-			w.WriteHeader(http.StatusOK)
-		case strings.HasSuffix(r.URL.Path, "/tags/list"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"name": "repo", "tags": []string{}})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(ts.Close)
-	return ts
-}
-
-// registryURL renders a test server as the oci:// URL a user would type.
-func registryURL(ts *httptest.Server) string {
-	return "oci://" + strings.TrimPrefix(ts.URL, "http://") + "/repo"
+	return registrytest.URL(registrytest.New().Serve(t))
 }
 
 func TestFsckOnAnEmptyRepository(t *testing.T) {
-	ts := emptyRegistry(t)
+	url := emptyRegistry(t)
 
-	stdout, stderr, err := runCLI(t, "fsck", registryURL(ts))
+	stdout, stderr, err := runCLI(t, "fsck", url)
 	if err != nil {
 		t.Fatalf("fsck on an empty repository should not fail: %v\nstderr: %s", err, stderr)
 	}
@@ -52,9 +34,9 @@ func TestFsckOnAnEmptyRepository(t *testing.T) {
 // answer, not an error. A user reaching for break-lock is already having a bad
 // day and should not be told off for guessing wrong about which ref is stuck.
 func TestBreakLockOnAnUnlockedRefIsANoOp(t *testing.T) {
-	ts := emptyRegistry(t)
+	url := emptyRegistry(t)
 
-	stdout, stderr, err := runCLI(t, "break-lock", registryURL(ts), "refs/heads/main")
+	stdout, stderr, err := runCLI(t, "break-lock", url, "refs/heads/main")
 	if err != nil {
 		t.Fatalf("break-lock on an unlocked ref: %v\nstderr: %s", err, stderr)
 	}
@@ -64,9 +46,9 @@ func TestBreakLockOnAnUnlockedRefIsANoOp(t *testing.T) {
 }
 
 func TestLFSLocksOnAnEmptyRepository(t *testing.T) {
-	ts := emptyRegistry(t)
+	url := emptyRegistry(t)
 
-	stdout, stderr, err := runCLI(t, "lfs-locks", registryURL(ts))
+	stdout, stderr, err := runCLI(t, "lfs-locks", url)
 	if err != nil {
 		t.Fatalf("lfs-locks on an empty repository: %v\nstderr: %s", err, stderr)
 	}
@@ -104,12 +86,12 @@ func TestSubcommandsReportAnUnreachableRegistry(t *testing.T) {
 // objects, so it needs a repository — and should say so rather than failing
 // somewhere deep in go-git.
 func TestGCOutsideAGitRepositoryExplainsItself(t *testing.T) {
-	ts := emptyRegistry(t)
+	url := emptyRegistry(t)
 	t.Chdir(t.TempDir())
 
 	// An empty repository short-circuits before the local objects are needed,
 	// so this asserts only that it does not fail confusingly.
-	if _, _, err := runCLI(t, "gc", registryURL(ts)); err != nil {
+	if _, _, err := runCLI(t, "gc", url); err != nil {
 		if !strings.Contains(err.Error(), "git repository") {
 			t.Errorf("gc outside a repository should explain itself, got: %v", err)
 		}

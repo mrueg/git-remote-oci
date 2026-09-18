@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -27,9 +28,8 @@ func headAdvertised(out string) string {
 // "develop", and an alphabetically earlier "aaa" is added afterwards precisely
 // to break the old heuristic.
 func TestHeadIsRecordedNotGuessed(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -69,9 +69,8 @@ func TestHeadIsRecordedNotGuessed(t *testing.T) {
 // TestHeadFallsBackWhenNoneRecorded checks repositories written before the
 // annotation existed still advertise something sensible.
 func TestHeadFallsBackWhenNoneRecorded(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -95,9 +94,8 @@ func TestHeadFallsBackWhenNoneRecorded(t *testing.T) {
 
 // TestHeadIsDroppedWhenItsRefIsDeleted pins that HEAD never dangles.
 func TestHeadIsDroppedWhenItsRefIsDeleted(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -128,13 +126,11 @@ func TestHeadIsDroppedWhenItsRefIsDeleted(t *testing.T) {
 
 // stripHeadAnnotation removes the recorded HEAD from every stored manifest,
 // producing what a repository written before HEAD was recorded looks like.
-func stripHeadAnnotation(t *testing.T, reg *mockRegistry) {
+func stripHeadAnnotation(t *testing.T, reg *registrytest.Registry) {
 	t.Helper()
 
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
-	for tag, raw := range reg.manifests {
+	for _, tag := range reg.Tags() {
+		raw := reg.RawManifest(t, tag)
 		var m map[string]any
 		if err := json.Unmarshal(raw, &m); err != nil {
 			continue
@@ -151,6 +147,6 @@ func stripHeadAnnotation(t *testing.T, reg *mockRegistry) {
 		if err != nil {
 			t.Fatalf("re-marshal %q: %v", tag, err)
 		}
-		reg.manifests[tag] = updated
+		reg.PutManifest(tag, updated)
 	}
 }

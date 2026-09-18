@@ -7,217 +7,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 
-	opencontainers "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-type mockRegistry struct {
-	mu        sync.Mutex
-	blobs     map[string][]byte
-	manifests map[string][]byte // reference/tag -> manifest JSON
-	tags      []string
-	// refuseDelete makes the registry answer every manifest DELETE with 405,
-	// which is how several hosted registries behave.
-	refuseDelete bool
-	// failDeleteWith, when non-zero, answers every manifest DELETE with that
-	// status, standing in for a transient failure rather than a policy.
-	failDeleteWith int
-	// intercept, when set, runs before any normal handling. Returning true
-	// means it wrote the response itself and the default path is skipped.
-	//
-	// It is called without m.mu held, so it may lock and mutate the maps above.
-	intercept func(w http.ResponseWriter, r *http.Request) bool
-}
-
-func newMockRegistry() *mockRegistry {
-	return &mockRegistry{
-		blobs:     make(map[string][]byte),
-		manifests: make(map[string][]byte),
-		tags:      make([]string, 0),
-	}
-}
-
-func (m *mockRegistry) Server() *httptest.Server {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-
-		m.mu.Lock()
-		hook := m.intercept
-		m.mu.Unlock()
-		if hook != nil && hook(w, r) {
-			return
-		}
-
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		if path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		// List tags: /v2/<repo>/tags/list
-		if strings.HasSuffix(path, "/tags/list") {
-			resp := map[string]any{
-				"name": "test-repo",
-				"tags": m.tags,
-			}
-			_ = json.NewEncoder(w).Encode(resp)
-			return
-		}
-
-		// Blob upload initiation: POST /v2/<repo>/blobs/uploads/
-		if r.Method == http.MethodPost && strings.Contains(path, "/blobs/uploads/") {
-			w.Header().Set("Location", "/v2/test-repo/blobs/uploads/session-1")
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-
-		// Blob upload PUT: PUT /v2/<repo>/blobs/uploads/session-1?digest=...
-		if r.Method == http.MethodPut && strings.Contains(path, "/blobs/uploads/") {
-			digest := r.URL.Query().Get("digest")
-			data, err := io.ReadAll(r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			// A conformant registry verifies that the uploaded bytes hash to
-			// the digest the client claimed, and rejects the upload otherwise.
-			// Modelling that matters: without it the mock happily stores a blob
-			// under a digest that does not describe it, which is exactly the
-			// bug this package has to avoid producing.
-			if digest != "" && opencontainers.FromBytes(data).String() != digest {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"errors":[{"code":"DIGEST_INVALID"}]}`))
-				return
-			}
-			m.blobs[digest] = data
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-
-		// Fetch blob: GET /v2/<repo>/blobs/<digest>
-		if r.Method == http.MethodGet && strings.Contains(path, "/blobs/") {
-			parts := strings.Split(path, "/blobs/")
-			digest := parts[len(parts)-1]
-			if data, ok := m.blobs[digest]; ok {
-				w.Header().Set("Content-Type", "application/octet-stream")
-				_, _ = w.Write(data)
-				return
-			}
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		// Push manifest: PUT /v2/<repo>/manifests/<tag-or-digest>
-		if r.Method == http.MethodPut && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			data, err := io.ReadAll(r.Body)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			m.manifests[ref] = data
-
-			// Keep track of tags
-			found := false
-			for _, t := range m.tags {
-				if t == ref {
-					found = true
-					break
-				}
-			}
-			if !found {
-				m.tags = append(m.tags, ref)
-			}
-
-			digest := opencontainers.FromBytes(data).String()
-			w.Header().Set("Docker-Content-Digest", digest)
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-
-		// Delete manifest: DELETE /v2/<repo>/manifests/<tag-or-digest>
-		if r.Method == http.MethodDelete && strings.Contains(path, "/manifests/") {
-			if m.failDeleteWith != 0 {
-				w.WriteHeader(m.failDeleteWith)
-				return
-			}
-			if m.refuseDelete {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusMethodNotAllowed)
-				_, _ = w.Write([]byte(`{"errors":[{"code":"UNSUPPORTED","message":"manifest delete is disabled"}]}`))
-				return
-			}
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			for tag, data := range m.manifests {
-				if tag == ref || opencontainers.FromBytes(data).String() == ref {
-					delete(m.manifests, tag)
-					newTags := make([]string, 0, len(m.tags))
-					for _, t := range m.tags {
-						if t != tag {
-							newTags = append(newTags, t)
-						}
-					}
-					m.tags = newTags
-				}
-			}
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-
-		// Fetch manifest: GET or HEAD /v2/<repo>/manifests/<tag-or-digest>
-		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.Contains(path, "/manifests/") {
-			parts := strings.Split(path, "/manifests/")
-			ref := parts[len(parts)-1]
-			data, ok := m.manifests[ref]
-			if !ok {
-				// A digest reference resolves to whichever tag carries it.
-				// Without this, anything that fetches by digest - including
-				// the referrers indexing oras does before a manifest delete -
-				// sees a 404.
-				for _, candidate := range m.manifests {
-					if opencontainers.FromBytes(candidate).String() == ref {
-						data, ok = candidate, true
-						break
-					}
-				}
-			}
-			if ok {
-				digest := opencontainers.FromBytes(data).String()
-				w.Header().Set("Docker-Content-Digest", digest)
-				w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-				if r.Method == http.MethodGet {
-					_, _ = w.Write(data)
-				}
-				return
-			}
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		w.WriteHeader(http.StatusNotFound)
-	})
-
-	return httptest.NewServer(mux)
-}
-
 func TestOCIClientPushAndFetch(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -271,9 +72,8 @@ func TestOCIClientPushAndFetch(t *testing.T) {
 }
 
 func TestPushCommitImageEmptyRefTag(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -298,9 +98,8 @@ func TestPushCommitImageEmptyRefTag(t *testing.T) {
 }
 
 func TestPushCommitStreamSizeValidation(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -331,9 +130,8 @@ func TestPushCommitStreamSizeValidation(t *testing.T) {
 }
 
 func TestPushCommitImageInvalidSHA(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -351,9 +149,8 @@ func TestPushCommitImageInvalidSHA(t *testing.T) {
 }
 
 func TestPushCommitImageTagCollision(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -407,83 +204,63 @@ func TestPushCommitImageTagCollision(t *testing.T) {
 }
 
 func TestFetchManifestMediaTypeWithParameters(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+
+	// A registry that decorates the media type with a parameter. The shared
+	// fake answers with the bare type, so this one request is answered here.
+	manifest, err := json.Marshal(ocispec.Manifest{
+		Versioned: ocispec.Manifest{}.Versioned,
+		Annotations: map[string]string{
+			ocispec.AnnotationRevision: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/manifests/v1.0.0") {
+			return false
 		}
-		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/v1.0.0") {
-			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json; charset=utf-8")
-			manifest := ocispec.Manifest{
-				Versioned: ocispec.Manifest{}.Versioned,
-				Annotations: map[string]string{
-					ocispec.AnnotationRevision: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-				},
-			}
-			_ = json.NewEncoder(w).Encode(manifest)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json; charset=utf-8")
+		w.Header().Set("Docker-Content-Digest", registrytest.Digest(manifest))
+		_, _ = w.Write(manifest)
+		return true
 	})
 
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
-	client, err := oci.NewClient(url, true)
-	if err != nil {
-		t.Fatalf("Failed to create OCI client: %v", err)
-	}
-
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
-	manifest, err := client.FetchManifest(ctx, "v1.0.0")
+	fetched, err := client.FetchManifest(ctx, "v1.0.0")
 	if err != nil {
 		t.Fatalf("FetchManifest failed for Content-Type with parameters: %v", err)
 	}
-	if manifest.Annotations[ocispec.AnnotationRevision] != "4b825dc642cb6eb9a060e54bf8d69288fbee4904" {
-		t.Errorf("Unexpected revision in manifest: %v", manifest.Annotations[ocispec.AnnotationRevision])
+	if fetched.Annotations[ocispec.AnnotationRevision] != "4b825dc642cb6eb9a060e54bf8d69288fbee4904" {
+		t.Errorf("Unexpected revision in manifest: %v", fetched.Annotations[ocispec.AnnotationRevision])
 	}
 }
 
 func TestListRefsIgnoresNonGitPackfileManifests(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v2/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/tags/list") {
-			_ = json.NewEncoder(w).Encode(map[string]any{"tags": []string{"latest"}})
-			return
-		}
-		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/latest") {
-			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-			// Non-git manifest (standard container image layer)
-			manifest := ocispec.Manifest{
-				Versioned: ocispec.Manifest{}.Versioned,
-				Layers: []ocispec.Descriptor{
-					{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Size: 100},
-				},
-				Annotations: map[string]string{
-					ocispec.AnnotationRevision: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-				},
-			}
-			_ = json.NewEncoder(w).Encode(manifest)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+
+	// A repository holding an ordinary container image: a manifest whose only
+	// layer is a filesystem tarball, tagged the way images are.
+	manifest, err := json.Marshal(ocispec.Manifest{
+		Versioned: ocispec.Manifest{}.Versioned,
+		MediaType: ocispec.MediaTypeImageManifest,
+		Layers: []ocispec.Descriptor{
+			{MediaType: "application/vnd.oci.image.layer.v1.tar+gzip", Size: 100},
+		},
+		Annotations: map[string]string{
+			ocispec.AnnotationRevision: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+		},
 	})
-
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
-	client, err := oci.NewClient(url, true)
 	if err != nil {
-		t.Fatalf("Failed to create OCI client: %v", err)
+		t.Fatalf("marshal manifest: %v", err)
 	}
+	reg.PutManifest("latest", manifest)
 
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 	refs, err := client.ListRefs(ctx)
 	if err != nil {
@@ -497,9 +274,8 @@ func TestOCIClientAuthEnv(t *testing.T) {
 	t.Setenv("OCI_USERNAME", "testuser")
 	t.Setenv("OCI_PASSWORD", "testpass")
 
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -513,9 +289,8 @@ func TestOCIClientAuthEnv(t *testing.T) {
 }
 
 func TestPushCommitStreamCompression(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -561,9 +336,8 @@ func TestPushCommitStreamCompression(t *testing.T) {
 }
 
 func TestRefIndex(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)
@@ -602,9 +376,8 @@ func TestRefIndex(t *testing.T) {
 }
 
 func TestDeleteRef(t *testing.T) {
-	mock := newMockRegistry()
-	ts := mock.Server()
-	defer ts.Close()
+	mock := registrytest.New()
+	ts := mock.Serve(t)
 
 	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	client, err := oci.NewClient(url, true)

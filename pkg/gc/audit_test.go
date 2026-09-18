@@ -4,10 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -398,27 +397,31 @@ func TestRunDoesNotRewindRefsIndexOnAPushDuringPruning(t *testing.T) {
 	}
 }
 
-// failingRefsWrite fronts a registry with a proxy that answers every write of
-// the `_refs` manifest with a server error and passes everything else through.
-//
-// A test needs to fail one specific request from the outside, and the shared
-// registry's hook can observe a request but not answer it.
-func failingRefsWrite(t *testing.T, upstream *httptest.Server) *httptest.Server {
-	t.Helper()
-	target, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.TagRefIndex) {
-			http.Error(w, "the registry is having a bad day", http.StatusInternalServerError)
-			return
+// failManifestWrites makes the registry answer every write of a manifest whose
+// tag satisfies match with a server error, and serve everything else itself.
+func failManifestWrites(reg *registrytest.Registry, match func(tag string) bool) {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut || !strings.Contains(r.URL.Path, "/manifests/") {
+			return false
 		}
-		proxy.ServeHTTP(w, r)
-	}))
-	t.Cleanup(front.Close)
-	return front
+		tag := r.URL.Path[strings.LastIndex(r.URL.Path, "/manifests/")+len("/manifests/"):]
+		if !match(tag) {
+			return false
+		}
+		http.Error(w, "the registry is having a bad day", http.StatusInternalServerError)
+		return true
+	})
+}
+
+// commitTagsOf lists the commit-id tags the registry holds.
+func commitTagsOf(reg *registrytest.Registry) []string {
+	var tags []string
+	for _, tag := range reg.Tags() {
+		if oci.ClassifyTag(tag) == oci.TagClassCommit {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
 }
 
 // TestRunDoesNotPruneWhenTheIndexWriteFails is M4.
@@ -435,23 +438,14 @@ func TestRunDoesNotPruneWhenTheIndexWriteFails(t *testing.T) {
 	client := registrytest.Client(t, ts)
 	repo, _ := registrytest.SeedRepository(t, client, 3)
 
-	commitTags := func() []string {
-		var tags []string
-		for _, tag := range reg.Tags() {
-			if oci.ClassifyTag(tag) == oci.TagClassCommit {
-				tags = append(tags, tag)
-			}
-		}
-		return tags
-	}
-	before := commitTags()
+	before := commitTagsOf(reg)
 	if len(before) != 3 {
 		t.Fatalf("fixture error: expected 3 commit tags, got %v", before)
 	}
 
-	front := failingRefsWrite(t, ts)
+	failManifestWrites(reg, func(tag string) bool { return tag == oci.TagRefIndex })
 	var log strings.Builder
-	_, err := gc.Run(context.Background(), registrytest.Client(t, front), repo, gc.Options{
+	_, err := gc.Run(context.Background(), registrytest.Client(t, ts), repo, gc.Options{
 		Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
 	})
 	if err == nil {
@@ -461,13 +455,21 @@ func TestRunDoesNotPruneWhenTheIndexWriteFails(t *testing.T) {
 		t.Errorf("the error does not say what failed: %v", err)
 	}
 
-	if after := commitTags(); len(after) != len(before) {
+	if after := commitTagsOf(reg); len(after) != len(before) {
 		t.Errorf("commit tags were pruned before the index write failed: %v -> %v; the published "+
 			"pack chain still names them, so the repository is now unclonable", before, after)
 	}
 
 	// Everything the chain names must still be there, which is what a reader
 	// that trusts the chain needs to be true.
+	reg.Intercept(nil)
+	assertPackChainServed(t, ts)
+}
+
+// assertPackChainServed checks that every manifest the published pack chain
+// names is still served, which is what a reader that trusts the chain needs.
+func assertPackChainServed(t *testing.T, ts *httptest.Server) {
+	t.Helper()
 	verifier := registrytest.Client(t, ts)
 	chain, _ := verifier.FetchPackChain(context.Background())
 	for sha, bases := range chain {
@@ -476,6 +478,111 @@ func TestRunDoesNotPruneWhenTheIndexWriteFails(t *testing.T) {
 				t.Errorf("the pack chain names %s, which the registry no longer serves: %v", named, err)
 			}
 		}
+	}
+}
+
+// TestRunDoesNotPruneWhenTheRepackFails is the phase before the index write:
+// the consolidation itself.
+//
+// A repack republishes a ref as one self-contained packfile -- blobs first,
+// then the commit and ref manifests -- and the commit tags it makes
+// redundant are pruned afterwards on the strength of that. A 500 partway
+// through the republish leaves the ref exactly as it was: its manifests still
+// name the intermediate commit tags as pack bases, so every one of those tags
+// is still load-bearing and the run has to stop with them all in place. The
+// registry fails the manifest and blob writes in turn, because the two land
+// in different steps of the same push.
+func TestRunDoesNotPruneWhenTheRepackFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(reg *registrytest.Registry, tip string)
+	}{
+		{"the rewritten commit manifest", func(reg *registrytest.Registry, tip string) {
+			failManifestWrites(reg, func(tag string) bool { return tag == tip })
+		}},
+		{"the rewritten ref manifest", func(reg *registrytest.Registry, _ string) {
+			failManifestWrites(reg, func(tag string) bool { return tag == oci.EncodeRefTag("refs/heads/main") })
+		}},
+		{"the consolidated packfile blob", func(reg *registrytest.Registry, _ string) {
+			// Only the packfile: the lock's config blob and the pack index
+			// go up the same way, and failing those would make gc skip the
+			// ref or drop the index, neither of which is a failed repack.
+			// A packfile announces itself in its first four bytes.
+			reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+				if r.Method != http.MethodPut || !strings.Contains(r.URL.Path, "/blobs/uploads/") {
+					return false
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					return false
+				}
+				if !bytes.HasPrefix(body, []byte("PACK")) {
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					return false
+				}
+				http.Error(w, "the registry is having a bad day", http.StatusInternalServerError)
+				return true
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := registrytest.New()
+			ts := reg.Serve(t)
+			client := registrytest.Client(t, ts)
+			repo, tip := registrytest.SeedRepository(t, client, 3)
+
+			before := commitTagsOf(reg)
+			if len(before) != 3 {
+				t.Fatalf("fixture error: expected 3 commit tags, got %v", before)
+			}
+			refBefore := reg.RawManifest(t, oci.EncodeRefTag("refs/heads/main"))
+
+			tc.fail(reg, tip)
+			var log strings.Builder
+			res, err := gc.Run(context.Background(), registrytest.Client(t, ts), repo, gc.Options{
+				Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
+			})
+			if err == nil {
+				t.Fatalf("gc.Run reported success although the repack could not be written: %+v\n%s", res, log.String())
+			}
+			if !strings.Contains(err.Error(), "repack") {
+				t.Errorf("the error does not say what failed: %v", err)
+			}
+
+			if after := commitTagsOf(reg); len(after) != len(before) {
+				t.Errorf("commit tags were pruned although the repack failed: %v -> %v; the ref's "+
+					"manifests still name them as pack bases, so the repository is now unclonable", before, after)
+			}
+			if !bytes.Equal(reg.RawManifest(t, oci.EncodeRefTag("refs/heads/main")), refBefore) {
+				t.Error("the ref manifest was rewritten by a repack that failed")
+			}
+			if len(reg.Deletions()) != 0 {
+				t.Errorf("a failed run issued deletions: %v", reg.Deletions())
+			}
+
+			// The repository must be exactly as clonable as before: the ref's
+			// pack bases and the chain both still resolve, and nothing is left
+			// locked behind a run that gave up.
+			reg.Intercept(nil)
+			assertPackChainServed(t, ts)
+			reader := registrytest.Client(t, ts)
+			manifest, err := reader.FetchManifest(context.Background(), oci.EncodeRefTag("refs/heads/main"))
+			if err != nil {
+				t.Fatalf("the ref manifest is gone: %v", err)
+			}
+			bases, err := oci.ParsePackBases(manifest.Annotations)
+			if err != nil {
+				t.Fatalf("the ref manifest's pack bases are unreadable: %v", err)
+			}
+			for _, base := range bases {
+				if _, err := reader.FetchManifest(context.Background(), base); err != nil {
+					t.Errorf("the ref manifest names pack base %s, which is no longer served: %v", base, err)
+				}
+			}
+			if locked, info, err := reader.IsLocked(context.Background(), "refs/heads/main"); err != nil || locked {
+				t.Errorf("the failed run left refs/heads/main locked (%+v, err=%v)", info, err)
+			}
+		})
 	}
 }
 

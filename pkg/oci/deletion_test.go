@@ -3,11 +3,14 @@ package oci_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 // TestDeleteRefOnRegistryThatRefusesManifestDeletion covers the hosted-registry
@@ -19,11 +22,10 @@ import (
 // reappears on the next push. A tombstone keeps that guarantee without needing
 // the registry to remove anything.
 func TestDeleteRefOnRegistryThatRefusesManifestDeletion(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	const (
@@ -44,9 +46,7 @@ func TestDeleteRefOnRegistryThatRefusesManifestDeletion(t *testing.T) {
 		t.Fatalf("setup failed: %s is not enumerable, got %v", refName, refs)
 	}
 
-	reg.mu.Lock()
-	reg.refuseDelete = true
-	reg.mu.Unlock()
+	failDeletesWith(reg, http.StatusMethodNotAllowed)
 
 	if err := client.DeleteRef(ctx, refName); err != nil {
 		t.Fatalf("DeleteRef should fall back to a tombstone when the registry refuses deletion, got: %v", err)
@@ -75,9 +75,7 @@ func TestDeleteRefOnRegistryThatRefusesManifestDeletion(t *testing.T) {
 	// The tag itself survives, because the registry would not remove it, and
 	// what it holds is a tombstone.
 	tag := oci.EncodeRefTag(refName)
-	reg.mu.Lock()
-	raw, ok := reg.manifests[tag]
-	reg.mu.Unlock()
+	raw, ok := reg.ManifestBytes(tag)
 	if !ok {
 		t.Fatalf("tag %q vanished even though the registry refuses deletion", tag)
 	}
@@ -99,11 +97,10 @@ func TestDeleteRefOnRegistryThatRefusesManifestDeletion(t *testing.T) {
 // could have been removed properly, and would report success for a deletion
 // that half happened.
 func TestDeleteRefStillFailsOnUnexpectedError(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	const (
@@ -114,9 +111,7 @@ func TestDeleteRefStillFailsOnUnexpectedError(t *testing.T) {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 
-	reg.mu.Lock()
-	reg.failDeleteWith = 500
-	reg.mu.Unlock()
+	failDeletesWith(reg, http.StatusInternalServerError)
 
 	err := client.DeleteRef(ctx, refName)
 	if err == nil {

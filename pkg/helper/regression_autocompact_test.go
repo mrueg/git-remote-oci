@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -80,11 +81,9 @@ func TestAutoCompactTriggersAtTheThreshold(t *testing.T) {
 }
 
 // commitTagsIn counts the commit-id tags the registry holds.
-func commitTagsIn(reg *mockRegistry) int {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
+func commitTagsIn(reg *registrytest.Registry) int {
 	n := 0
-	for _, tag := range reg.tags {
+	for _, tag := range reg.Tags() {
 		if oci.ClassifyTag(tag) == oci.TagClassCommit {
 			n++
 		}
@@ -130,15 +129,13 @@ func TestAutoCompactFailureDoesNotFailThePush(t *testing.T) {
 	// Break everything compaction needs, and nothing the push needs: a
 	// registry that refuses to delete a tag is a real and common
 	// configuration, and consolidation writes before it prunes.
-	reg.mu.Lock()
-	reg.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodDelete {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return true
 		}
 		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	src := t.TempDir()
 	git(t, src, "clone", "-q", url, src)

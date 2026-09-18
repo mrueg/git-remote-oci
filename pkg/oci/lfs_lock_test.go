@@ -5,13 +5,13 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 func TestLFSLockingAPI(t *testing.T) {
-	mock := newMockRegistry()
-	server := mock.Server()
-	defer server.Close()
+	mock := registrytest.New()
+	server := mock.Serve(t)
 
 	u, err := url.Parse(server.URL)
 	if err != nil {

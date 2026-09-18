@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -16,11 +17,10 @@ import (
 // against GHCR, ECR or Docker Hub - throwing away the consolidation it had
 // already completed, which is the half that actually makes clones cheaper.
 func TestDeleteTagReportsUnsupportedDeletionDistinctly(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	const commitSHA = "7777777777777777777777777777777777777777"
@@ -28,9 +28,7 @@ func TestDeleteTagReportsUnsupportedDeletionDistinctly(t *testing.T) {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 
-	reg.mu.Lock()
-	reg.refuseDelete = true
-	reg.mu.Unlock()
+	failDeletesWith(reg, http.StatusMethodNotAllowed)
 
 	err := client.DeleteTag(ctx, commitSHA)
 	if err == nil {
@@ -42,10 +40,7 @@ func TestDeleteTagReportsUnsupportedDeletionDistinctly(t *testing.T) {
 
 	// A transient failure must stay distinguishable, or gc would silently skip
 	// tags it could actually have removed.
-	reg.mu.Lock()
-	reg.refuseDelete = false
-	reg.failDeleteWith = http.StatusInternalServerError
-	reg.mu.Unlock()
+	failDeletesWith(reg, http.StatusInternalServerError)
 
 	err = client.DeleteTag(ctx, commitSHA)
 	if err == nil {

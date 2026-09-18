@@ -182,6 +182,61 @@ func TestRetryTransportBodyRewind(t *testing.T) {
 	}
 }
 
+// TestRetryTransportDoesNotReplayANonRewindableBody is the other half of the
+// rewind test: a body with no GetBody cannot be sent twice, and a transport
+// that retried it anyway would send an empty second request -- which for a
+// blob upload is a truncated blob the registry may well accept. So a 503 on
+// such a request has to come back after the first attempt, as the failure it
+// is, and never be retried.
+func TestRetryTransportDoesNotReplayANonRewindableBody(t *testing.T) {
+	var attempts atomic.Int32
+	var bodies []string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	rt := newRetryTransport(ts.Client().Transport)
+	rt.initialInterval = time.Millisecond
+
+	// A streaming body: a pipe has no GetBody, and NewRequest cannot invent
+	// one for it the way it does for a bytes.Reader.
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = io.WriteString(pw, "chunk-data")
+		_ = pw.Close()
+	}()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPatch, ts.URL, pr)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	if req.GetBody != nil {
+		t.Fatal("test setup: a pipe body should not be rewindable")
+	}
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// The 503 is the answer: handed back untouched for the caller to treat as
+	// the error it is, rather than swallowed by a retry.
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want the registry's 503 passed through", resp.StatusCode)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("a request whose body cannot be replayed was sent %d times, want 1", got)
+	}
+	if bodies[0] != "chunk-data" {
+		t.Errorf("the one attempt carried body %q, want %q", bodies[0], "chunk-data")
+	}
+}
+
 // TestCalculateBackoffHonoursRetryAfter pins that a Retry-After is waited out
 // on its own ceiling. It used to be clamped to the backoff's maxInterval,
 // which left maxRetryAfter with nothing to do and retried into a registry

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -26,26 +27,10 @@ import (
 // point and the part no functional check would notice: a helper that downloads
 // everything still produces a correct checkout.
 
-// requestsSince returns the requests the registry served after mark.
-func (m *mockRegistry) requestsSince(mark int) []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]string(nil), m.requests[mark:]...)
-}
-
-// requestMark is the current end of the request log, to measure from.
-func (m *mockRegistry) requestMark() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.requests)
-}
-
 // packfileLayerOf returns the digest of the packfile a ref's manifest carries.
-func (m *mockRegistry) packfileLayerOf(t *testing.T, refName string) string {
+func packfileLayerOf(t *testing.T, reg *registrytest.Registry, refName string) string {
 	t.Helper()
-	m.mu.Lock()
-	raw, ok := m.manifests[oci.EncodeRefTag(refName)]
-	m.mu.Unlock()
+	raw, ok := reg.ManifestBytes(oci.EncodeRefTag(refName))
 	if !ok {
 		t.Fatalf("%s was never pushed", refName)
 	}
@@ -64,11 +49,9 @@ func (m *mockRegistry) packfileLayerOf(t *testing.T, refName string) string {
 }
 
 // hasPackIndexLayer reports whether a ref's manifest published an object index.
-func (m *mockRegistry) hasPackIndexLayer(t *testing.T, refName string) bool {
+func hasPackIndexLayer(t *testing.T, reg *registrytest.Registry, refName string) bool {
 	t.Helper()
-	m.mu.Lock()
-	raw := m.manifests[oci.EncodeRefTag(refName)]
-	m.mu.Unlock()
+	raw, _ := reg.ManifestBytes(oci.EncodeRefTag(refName))
 
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
@@ -107,7 +90,7 @@ func TestPackIndexSkipsRefsThatCannotHoldTheObject(t *testing.T) {
 	// place. Checking that here separates "the reader declined to skip" from
 	// "the writer never gave it anything to read", which are the same symptom.
 	for _, branch := range []string{"main", "alpha", "beta", "gamma"} {
-		if !reg.hasPackIndexLayer(t, "refs/heads/"+branch) {
+		if !hasPackIndexLayer(t, reg, "refs/heads/"+branch) {
 			t.Fatalf("push of %s published no pack index layer", branch)
 		}
 	}
@@ -119,12 +102,12 @@ func TestPackIndexSkipsRefsThatCannotHoldTheObject(t *testing.T) {
 	}
 	dst := filepath.Join(parent, "dst")
 
-	alphaPack := reg.packfileLayerOf(t, "refs/heads/alpha")
-	betaPack := reg.packfileLayerOf(t, "refs/heads/beta")
-	gammaPack := reg.packfileLayerOf(t, "refs/heads/gamma")
+	alphaPack := packfileLayerOf(t, reg, "refs/heads/alpha")
+	betaPack := packfileLayerOf(t, reg, "refs/heads/beta")
+	gammaPack := packfileLayerOf(t, reg, "refs/heads/gamma")
 
 	// Measure only the lazy fetch. The clone legitimately touches everything.
-	mark := reg.requestMark()
+	mark := len(reg.Requests())
 	out, err := v2run(t, dst, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
 		"checkout", "-f", "gamma")
 	if err != nil {
@@ -138,7 +121,7 @@ func TestPackIndexSkipsRefsThatCannotHoldTheObject(t *testing.T) {
 		t.Fatalf("gamma.txt = %q (err=%v), want \"gamma\"", string(body), err)
 	}
 
-	fetched := reg.requestsSince(mark)
+	fetched := reg.Requests()[mark:]
 	wasFetched := func(digest string) bool {
 		for _, req := range fetched {
 			if strings.HasPrefix(req, "GET ") && strings.HasSuffix(req, "/blobs/"+digest) {
@@ -190,26 +173,9 @@ func TestPackIndexAbsentFallsBackToStaging(t *testing.T) {
 	git(t, src, "-C", src, "push", "-q", url, "gamma")
 
 	// Rewrite every manifest as an older build would have written it.
-	reg.mu.Lock()
-	for tag, raw := range reg.manifests {
-		var manifest ocispec.Manifest
-		if err := json.Unmarshal(raw, &manifest); err != nil {
-			continue
-		}
-		kept := manifest.Layers[:0]
-		for _, layer := range manifest.Layers {
-			if layer.MediaType != oci.MediaTypeGitPackIndex {
-				kept = append(kept, layer)
-			}
-		}
-		manifest.Layers = kept
-		stripped, err := json.Marshal(manifest)
-		if err != nil {
-			continue
-		}
-		reg.manifests[tag] = stripped
+	if err := reg.StripLayers(oci.MediaTypeGitPackIndex); err != nil {
+		t.Fatalf("StripLayers: %v", err)
 	}
-	reg.mu.Unlock()
 
 	parent := t.TempDir()
 	if out, err := v2run(t, parent, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
@@ -239,9 +205,8 @@ func TestPackIndexAbsentFallsBackToStaging(t *testing.T) {
 // a reader cannot tell which path wrote a manifest, so a ref pushed atomically
 // has to carry one just the same. Nothing else here exercises that half.
 func TestPackIndexIsPublishedByTheAtomicPushPath(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -263,7 +228,7 @@ func TestPackIndexIsPublishedByTheAtomicPushPath(t *testing.T) {
 	}
 
 	for _, branch := range []string{"main", "second"} {
-		if !reg.hasPackIndexLayer(t, "refs/heads/"+branch) {
+		if !hasPackIndexLayer(t, reg, "refs/heads/"+branch) {
 			t.Errorf("the atomic push of %s published no pack index layer", branch)
 		}
 	}
