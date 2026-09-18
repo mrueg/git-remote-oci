@@ -25,7 +25,7 @@ func runBreakLock(ctx context.Context, env Env) error {
 	fs.SetOutput(env.Stderr)
 	force := fs.Bool("force", false, "release the lock even though this client does not hold it")
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci break-lock [flags] <oci-url> <ref>
+		diag(env.Stderr, `usage: git-remote-oci break-lock [flags] <oci-url> <ref>
 
 Releases an advisory lock on a ref.
 
@@ -60,8 +60,7 @@ Flags:
 		return fmt.Errorf("failed to read the lock on %s: %w", refName, err)
 	}
 	if !held {
-		fmt.Fprintf(env.Stdout, "%s is not locked\n", refName)
-		return nil
+		return printf(env.Stdout, "%s is not locked\n", refName)
 	}
 
 	owner := "an unknown owner"
@@ -79,8 +78,7 @@ Flags:
 	if err := client.BreakRefLock(ctx, refName); err != nil {
 		return fmt.Errorf("failed to break the lock on %s: %w", refName, err)
 	}
-	fmt.Fprintf(env.Stdout, "broke the lock on %s, previously held by %s\n", refName, owner)
-	return nil
+	return printf(env.Stdout, "broke the lock on %s, previously held by %s\n", refName, owner)
 }
 
 // lockExpiry renders a lock's expiry for a message.

@@ -25,6 +25,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os/exec"
@@ -75,11 +76,17 @@ type Config struct {
 // yields a Config that returns defaults rather than an error: a tunable that
 // cannot be read is not a reason to refuse to push.
 func Load(remote string) *Config {
-	c := &Config{values: map[string]string{}, remote: strings.ToLower(remote)}
+	// The remote name is kept as given: it is a subsection, and git keeps
+	// those case-sensitive. See normaliseName.
+	c := &Config{values: map[string]string{}, remote: remote}
 
 	// -z separates entries with NUL and the name from the value with a
 	// newline, so a value containing either character cannot be misparsed.
-	out, err := exec.Command("git", "config", "--list", "-z").Output()
+	//
+	// context.Background: Load has no context to offer -- it is called at the
+	// entry points, before anything cancellable exists, and never fails, so
+	// there is nothing a cancellation would change.
+	out, err := exec.CommandContext(context.Background(), "git", "config", "--list", "-z").Output()
 	if err != nil {
 		return c
 	}
@@ -89,13 +96,30 @@ func Load(remote string) *Config {
 			// A name with no newline is a valueless boolean, e.g. `[x] y`.
 			// Git spells that "true".
 			if entry != "" {
-				c.values[strings.ToLower(entry)] = "true"
+				c.values[normaliseName(entry)] = "true"
 			}
 			continue
 		}
-		c.values[strings.ToLower(name)] = value
+		c.values[normaliseName(name)] = value
 	}
 	return c
+}
+
+// normaliseName lowercases the section and the variable of a config name and
+// leaves the subsection alone.
+//
+// That is git's own rule: `remote.Origin.url` and `remote.origin.url` are two
+// different remotes, and `git config --list` reports the subsection exactly as
+// it was written. Lowercasing the whole name folded the two together, so a
+// remote whose name had a capital in it read another remote's settings -- or
+// its own under a name git would never have handed over.
+func normaliseName(name string) string {
+	first := strings.IndexByte(name, '.')
+	last := strings.LastIndexByte(name, '.')
+	if first < 0 || first == last {
+		return strings.ToLower(name)
+	}
+	return strings.ToLower(name[:first]) + name[first:last] + strings.ToLower(name[last:])
 }
 
 // lookup resolves a key, preferring the per-remote scope.
@@ -132,6 +156,24 @@ func (c *Config) Int(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+// Count returns a configured non-negative integer, or def.
+//
+// It differs from Int in accepting zero. Int is for sizes and pool widths,
+// where zero is a typo; Count is for thresholds where zero is a real setting
+// -- `compactAfter = 0` is how automatic compaction is switched off, and Int
+// read that as "use the default", which switched it on.
+func (c *Config) Count(key string, def int) int {
+	v, ok := c.lookup(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
 		return def
 	}
 	return n
