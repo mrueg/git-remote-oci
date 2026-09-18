@@ -3,6 +3,7 @@ package oci
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"testing"
 )
 
@@ -68,28 +69,28 @@ func FuzzParseRetryAfter(f *testing.F) {
 		// The parser deliberately reports whatever the header said; bounding it
 		// is the backoff calculation's job. Assert that guarantee here, because
 		// it is what actually protects the caller: a registry answering
-		// "Retry-After: 87000" must not stall a push for a day.
+		// "Retry-After: 87000" must not stall a push for a day. A Retry-After
+		// is honoured past the backoff's own cap, on its own ceiling.
 		rt := newRetryTransport(nil)
 		for attempt := range 4 {
 			backoff := rt.calculateBackoff(attempt, d)
 			if backoff < 0 {
 				t.Fatalf("calculateBackoff(%d, %v) = %v, which is negative", attempt, d, backoff)
 			}
-			if backoff > rt.maxInterval {
-				t.Fatalf("calculateBackoff(%d, %v) = %v, over maxInterval %v", attempt, d, backoff, rt.maxInterval)
+			if backoff > max(rt.maxInterval, maxRetryAfter) {
+				t.Fatalf("calculateBackoff(%d, %v) = %v, over the %v ceiling", attempt, d, backoff, maxRetryAfter)
 			}
 		}
 	})
 }
 
-// FuzzDecompressPackfile feeds arbitrary bytes to the layer decompressor.
+// FuzzDecompressStream feeds arbitrary bytes to the layer decompressor.
 //
 // Layer content and its media type both come from the registry. The
-// decompressor must never panic and must never return more than the configured
-// limit.
-func FuzzDecompressPackfile(f *testing.F) {
-	gz, _, _ := compressPackfile([]byte("packfile"), "gzip")
-	zs, _, _ := compressPackfile([]byte("packfile"), "zstd")
+// decompressor must never panic, and raw input must pass through untouched.
+func FuzzDecompressStream(f *testing.F) {
+	gz, _, _ := compressBytes([]byte("packfile"), "gzip")
+	zs, _, _ := compressBytes([]byte("packfile"), "zstd")
 	f.Add(gz, MediaTypeGitPackfileGzip)
 	f.Add(zs, MediaTypeGitPackfileZstd)
 	f.Add([]byte("PACK raw bytes"), MediaTypeGitPackfile)
@@ -98,20 +99,21 @@ func FuzzDecompressPackfile(f *testing.F) {
 	f.Add([]byte{}, "")
 
 	f.Fuzz(func(t *testing.T, data []byte, mediaType string) {
-		out, err := decompressPackfile(data, mediaType)
+		rc, err := DecompressStream(io.NopCloser(bytes.NewReader(data)), mediaType)
 		if err != nil {
 			return
 		}
-		if int64(len(out)) > maxDecompressedSize {
-			t.Fatalf("decompressPackfile returned %d bytes, over the %d limit", len(out), int64(maxDecompressedSize))
+		// Bounded: the stream is consumed by git in production and never
+		// buffered, so the only thing to check here is that reading it does
+		// not misbehave, not how much it expands to.
+		out, err := io.ReadAll(io.LimitReader(rc, 1<<20))
+		_ = rc.Close()
+		if err != nil {
+			return
 		}
 		// Uncompressed input must be passed through untouched.
-		if len(data) >= 4 && !bytes.HasPrefix(data, []byte{0x1f, 0x8b}) &&
-			!bytes.HasPrefix(data, []byte{0x28, 0xb5, 0x2f, 0xfd}) &&
-			mediaType == MediaTypeGitPackfile {
-			if !bytes.Equal(out, data) {
-				t.Fatalf("uncompressed input was altered")
-			}
+		if mediaType == MediaTypeGitPackfile && !bytes.Equal(out, data) {
+			t.Fatalf("uncompressed input was altered")
 		}
 	})
 }

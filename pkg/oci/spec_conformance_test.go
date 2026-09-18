@@ -213,7 +213,7 @@ func TestOCIImageIndexEntriesArePlatformQualified(t *testing.T) {
 	ctx := context.Background()
 
 	commitSHA := "2222222222222222222222222222222222222222"
-	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", "main", "", []byte("PACK-x")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", "main", []byte("PACK-x")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 	if err := client.PushOCIImageIndex(ctx, oci.TagOCIIndex, map[string]oci.RefEntry{

@@ -42,10 +42,7 @@ func TestDecompressStreamClosesUnderlyingStream(t *testing.T) {
 		{"none", MediaTypeGitPackfile},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
-			compressed, _, err := compressPackfile(payload, mode.name)
-			if err != nil {
-				t.Fatalf("compressPackfile: %v", err)
-			}
+			compressed, _ := compressForTest(t, payload, mode.name)
 
 			spy := &spyCloser{Reader: bytes.NewReader(compressed)}
 			rc, err := DecompressStream(spy, mode.mediaType)
@@ -68,36 +65,6 @@ func TestDecompressStreamClosesUnderlyingStream(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestReadAllLimitedRejectsOversizedStream caps how far a small registry layer
-// may expand. Registry content is untrusted, so a highly compressible layer
-// must not be able to exhaust memory.
-func TestReadAllLimitedRejectsOversizedStream(t *testing.T) {
-	// An endless stream must be refused rather than buffered.
-	if _, err := readAllLimited(zeroReader{}, 1024); !errors.Is(err, errTooLarge) {
-		t.Errorf("expected errTooLarge for an endless stream, got %v", err)
-	}
-	// Exactly at the limit is fine.
-	if got, err := readAllLimited(bytes.NewReader(make([]byte, 1024)), 1024); err != nil {
-		t.Errorf("a payload exactly at the limit must be accepted, got %v (%d bytes)", err, len(got))
-	}
-	// One byte over is not.
-	if _, err := readAllLimited(bytes.NewReader(make([]byte, 1025)), 1024); !errors.Is(err, errTooLarge) {
-		t.Errorf("expected errTooLarge one byte over the limit, got %v", err)
-	}
-	// The production limit is what the decompressors actually use.
-	if maxDecompressedSize <= 0 {
-		t.Error("maxDecompressedSize must be positive")
-	}
-}
-
-// zeroReader yields an unbounded stream of zero bytes.
-type zeroReader struct{}
-
-func (zeroReader) Read(p []byte) (int, error) {
-	clear(p)
-	return len(p), nil
 }
 
 // TestRoundTripDoesNotMutateRequest pins the http.RoundTripper contract: the

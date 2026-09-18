@@ -1,7 +1,6 @@
 package oci
 
 import (
-	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -19,12 +18,6 @@ const (
 )
 
 var (
-	bytesBufferPool = sync.Pool{
-		New: func() any {
-			return new(bytes.Buffer)
-		},
-	}
-
 	gzipWriterPool = sync.Pool{
 		New: func() any {
 			return gzip.NewWriter(io.Discard)
@@ -41,15 +34,6 @@ var (
 		},
 	}
 )
-
-func getBytesBuffer() *bytes.Buffer {
-	buf, ok := bytesBufferPool.Get().(*bytes.Buffer)
-	if !ok {
-		buf = new(bytes.Buffer)
-	}
-	buf.Reset()
-	return buf
-}
 
 // getGzipWriter returns a pooled gzip.Writer already reset to w.
 func getGzipWriter(w io.Writer) *gzip.Writer {
@@ -74,13 +58,6 @@ func getZstdEncoder(w io.Writer) *zstd.Encoder {
 	}
 	zw.Reset(w)
 	return zw
-}
-
-func putBytesBuffer(buf *bytes.Buffer) {
-	if buf != nil {
-		buf.Reset()
-		bytesBufferPool.Put(buf)
-	}
 }
 
 type pooledGzipWriter struct {
@@ -109,53 +86,6 @@ func (p *pooledZstdWriter) Close() error {
 	err := p.zw.Close()
 	zstdEncoderPool.Put(p.zw)
 	return err
-}
-
-// compressPackfile compresses raw packfile data using the specified mode ("gzip", "zstd", or "none").
-// Returns compressed bytes and the corresponding OCI media type. Uses sync.Pool for buffer reuse.
-func compressPackfile(data []byte, mode string) ([]byte, string, error) {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "gzip":
-		buf := getBytesBuffer()
-		defer putBytesBuffer(buf)
-
-		gw := getGzipWriter(buf)
-		if _, err := gw.Write(data); err != nil {
-			gzipWriterPool.Put(gw)
-			return nil, "", fmt.Errorf("gzip compression failed: %w", err)
-		}
-		if err := gw.Close(); err != nil {
-			gzipWriterPool.Put(gw)
-			return nil, "", fmt.Errorf("gzip writer close failed: %w", err)
-		}
-		res := append([]byte(nil), buf.Bytes()...)
-		gzipWriterPool.Put(gw)
-		return res, MediaTypeGitPackfileGzip, nil
-
-	case "zstd":
-		buf := getBytesBuffer()
-		defer putBytesBuffer(buf)
-
-		zw := getZstdEncoder(buf)
-		if _, err := zw.Write(data); err != nil {
-			_ = zw.Close()
-			zstdEncoderPool.Put(zw)
-			return nil, "", fmt.Errorf("zstd compression failed: %w", err)
-		}
-		if err := zw.Close(); err != nil {
-			zstdEncoderPool.Put(zw)
-			return nil, "", fmt.Errorf("zstd writer close failed: %w", err)
-		}
-		res := append([]byte(nil), buf.Bytes()...)
-		zstdEncoderPool.Put(zw)
-		return res, MediaTypeGitPackfileZstd, nil
-
-	case "none", "raw", "":
-		return data, MediaTypeGitPackfile, nil
-
-	default:
-		return nil, "", fmt.Errorf("unsupported compression mode: %s", mode)
-	}
 }
 
 type nopWriteCloser struct {
@@ -197,60 +127,6 @@ func CompressStream(w io.Writer, mode string) (io.WriteCloser, string, error) {
 	default:
 		return nil, "", fmt.Errorf("unsupported compression mode: %s", mode)
 	}
-}
-
-// maxDecompressedSize bounds how much a single compressed registry layer may
-// expand to. Registry content is untrusted, and a small layer can otherwise
-// decompress to an arbitrary amount of memory.
-const maxDecompressedSize = 8 << 30 // 8 GiB
-
-// errTooLarge reports that a stream exceeded maxDecompressedSize.
-var errTooLarge = fmt.Errorf("decompressed layer exceeds the %d byte limit", int64(maxDecompressedSize))
-
-// readAllLimited reads r to EOF, refusing to buffer more than limit bytes.
-func readAllLimited(r io.Reader, limit int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, errTooLarge
-	}
-	return data, nil
-}
-
-// decompressPackfile decompresses layer bytes based on media type or magic header bytes.
-func decompressPackfile(data []byte, mediaType string) ([]byte, error) {
-	if len(data) == 0 {
-		return data, nil
-	}
-
-	cleanType := strings.ToLower(strings.TrimSpace(strings.Split(mediaType, ";")[0]))
-
-	// 1. Check Media Type or Gzip Magic Header (0x1f 0x8b)
-	if cleanType == MediaTypeGitPackfileGzip ||
-		(len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b) {
-		gr, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-		}
-		defer func() { _ = gr.Close() }()
-		return readAllLimited(gr, maxDecompressedSize)
-	}
-
-	// 2. Check Media Type or Zstd Magic Header (0x28 0xb5 0x2f 0xfd)
-	if cleanType == MediaTypeGitPackfileZstd ||
-		(len(data) >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd) {
-		zr, err := zstd.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create zstd reader: %w", err)
-		}
-		defer zr.Close()
-		return readAllLimited(zr, maxDecompressedSize)
-	}
-
-	// 3. Raw / Uncompressed
-	return data, nil
 }
 
 // decompReadCloser pairs a decompressing reader with the underlying stream.

@@ -117,6 +117,12 @@ func (c *Client) pushBlobResumable(ctx context.Context, desc ocispec.Descriptor,
 				}
 				offset, location = resumed, next
 				if offset >= desc.Size {
+					// The registry already holds the whole blob: the last
+					// PATCH landed and only its response was lost. That is
+					// not a failure to carry out of the loop, and doing so
+					// used to fail a push the registry had in fact accepted.
+					lastErr = nil
+					end = desc.Size
 					break
 				}
 				end = min(offset+chunk, desc.Size)

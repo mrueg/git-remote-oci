@@ -61,6 +61,15 @@ type Registry struct {
 	// It runs without r.mu held, so it may call the mutators on this type.
 	observe func(method, path string)
 
+	// intercept, if set, runs after observe and may answer the request
+	// itself: returning true means it wrote the response and the registry
+	// does nothing further. It is how a test makes the registry *fail* a
+	// particular request -- a 500 on one tag, say -- which observe cannot,
+	// since observe only watches.
+	//
+	// Like observe it runs without r.mu held.
+	intercept func(w http.ResponseWriter, req *http.Request) bool
+
 	deleted []string
 }
 
@@ -69,6 +78,14 @@ func (r *Registry) Observe(hook func(method, path string)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.observe = hook
+}
+
+// Intercept installs a hook that may answer a request in the registry's place.
+// Returning true from the hook means it has written the response.
+func (r *Registry) Intercept(hook func(w http.ResponseWriter, req *http.Request) bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.intercept = hook
 }
 
 // New returns an empty registry.
@@ -95,10 +112,13 @@ func (r *Registry) handle(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Path
 
 	r.mu.Lock()
-	hook := r.observe
+	hook, intercept := r.observe, r.intercept
 	r.mu.Unlock()
 	if hook != nil {
 		hook(req.Method, path)
+	}
+	if intercept != nil && intercept(w, req) {
+		return
 	}
 
 	r.mu.Lock()
@@ -281,7 +301,7 @@ func SeedRepository(t *testing.T, client *oci.Client, n int) (*git.Repository, s
 	dir := t.TempDir()
 	run := func(args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = append(os.Environ(),
 			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
@@ -625,4 +645,41 @@ func (r *Registry) BlobBytes(digest string) []byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]byte(nil), r.blobs[digest]...)
+}
+
+// SetBlobBytes replaces the content stored under a digest, leaving the digest
+// as it was.
+//
+// This is a registry serving the wrong bytes for a blob -- a corrupted store,
+// a proxy answering from the wrong entry -- which is exactly the thing a
+// reader has to notice for itself, because the digest header still matches.
+func (r *Registry) SetBlobBytes(digest string, data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.blobs[digest] = append([]byte(nil), data...)
+}
+
+// PutBlob stores data under its own digest and returns that digest.
+func (r *Registry) PutBlob(data []byte) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	digest := opencontainers.FromBytes(data).String()
+	r.blobs[digest] = append([]byte(nil), data...)
+	return digest
+}
+
+// PutManifest stores data under tag, addressable by digest as well, exactly
+// as a PUT from another client would leave it.
+//
+// It exists for the same reason as SetIndexedRef: the realistic way to have a
+// second writer land between a client's read and its write -- running that
+// writer from inside a request hook -- serialises on the index lock and
+// deadlocks instead of interleaving.
+func (r *Registry) PutManifest(tag string, data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stored := append([]byte(nil), data...)
+	r.manifests[tag] = stored
+	r.byDigest[Digest(stored)] = stored
+	r.addTag(tag)
 }

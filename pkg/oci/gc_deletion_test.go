@@ -24,7 +24,7 @@ func TestDeleteTagReportsUnsupportedDeletionDistinctly(t *testing.T) {
 	ctx := context.Background()
 
 	const commitSHA = "7777777777777777777777777777777777777777"
-	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", "main", "", []byte("PACK")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", "main", []byte("PACK")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 

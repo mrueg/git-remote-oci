@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/mrueg/git-remote-oci/pkg/lfs"
 )
 
 // ErrDeletionUnsupported reports that the registry refuses manifest deletion
@@ -19,7 +21,7 @@ type TagClass int
 const (
 	// TagClassMetadata is one of the fixed index tags (_refs, _index, ...).
 	TagClassMetadata TagClass = iota
-	// TagClassLock is a ref lock (lock-<ref>).
+	// TagClassLock is a ref lock (_lock_<encoded ref>, see LockTag).
 	TagClassLock
 	// TagClassCommit is a ref-agnostic commit manifest, tagged with the commit id.
 	TagClassCommit
@@ -45,7 +47,7 @@ func (c TagClass) String() string {
 // whether it is still needed.
 func ClassifyTag(tag string) TagClass {
 	switch {
-	case tag == TagRefIndex || tag == TagOCIIndex || tag == "_lfs_locks":
+	case tag == TagRefIndex || tag == TagOCIIndex || tag == lfs.TagLFSLocks:
 		return TagClassMetadata
 	case strings.HasPrefix(tag, LockTagPrefix):
 		return TagClassLock

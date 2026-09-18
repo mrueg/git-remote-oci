@@ -1,10 +1,78 @@
 package oci
 
 import (
+	"encoding/hex"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+// decodeRefTag is the inverse of EncodeRefTag for tags that were not truncated.
+// It returns an error for tags that are not valid output of EncodeRefTag, and
+// for truncated tags, whose original ref name is not recoverable.
+//
+// It lives with the tests because nothing in production decodes a tag: the ref
+// name is always read from the manifest's annotation, never recovered from the
+// tag. The decoder exists to prove the encoding is reversible, and therefore
+// injective, which is the property the tests below pin.
+func decodeRefTag(tag string) (string, error) {
+	switch {
+	case tag == "":
+		return "", fmt.Errorf("empty tag")
+	case strings.HasPrefix(tag, nsTruncated):
+		return "", fmt.Errorf("tag %q was truncated; the original ref name is not recoverable", tag)
+	case strings.HasPrefix(tag, nsTag):
+		name, err := unescapeTag(strings.TrimPrefix(tag, nsTag))
+		if err != nil {
+			return "", err
+		}
+		return "refs/tags/" + name, nil
+	case strings.HasPrefix(tag, nsRef):
+		name, err := unescapeTag(strings.TrimPrefix(tag, nsRef))
+		if err != nil {
+			return "", err
+		}
+		return "refs/" + name, nil
+	case strings.HasPrefix(tag, nsOther):
+		return unescapeTag(strings.TrimPrefix(tag, nsOther))
+	default:
+		name, err := unescapeTag(tag)
+		if err != nil {
+			return "", err
+		}
+		return "refs/heads/" + name, nil
+	}
+}
+
+// unescapeTag reverses escapeTag.
+func unescapeTag(s string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '_' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '_' {
+			b.WriteByte('_')
+			i += 2
+			continue
+		}
+		if i+2 >= len(s) {
+			return "", fmt.Errorf("truncated escape sequence at offset %d in %q", i, s)
+		}
+		decoded, err := hex.DecodeString(s[i+1 : i+3])
+		if err != nil {
+			return "", fmt.Errorf("invalid escape sequence at offset %d in %q: %w", i, s, err)
+		}
+		b.WriteByte(decoded[0])
+		i += 3
+	}
+	return b.String(), nil
+}
 
 // ociTagPattern is the tag grammar from the OCI distribution specification.
 // The external test file keeps its own copy; these are different packages.
@@ -120,5 +188,53 @@ func TestTruncatedTagsCannotCollideWithShortRefs(t *testing.T) {
 	shortRef := "refs/heads/" + strings.TrimPrefix(longTag, "_h_")
 	if shortTag := EncodeRefTag(shortRef); shortTag == longTag {
 		t.Errorf("long ref %q and short ref %q both encode to %q", longRef, shortRef, longTag)
+	}
+}
+
+// TestLockTagFitsForRefsThatFillTheTagLimit pins the lock tag's length budget.
+//
+// A ref whose encoding is 125-128 bytes is a legal ref tag, but the lock tag
+// prefixes it, and "_lock_" plus 128 bytes is not a legal tag at all: the
+// registry refused it, so the ref could not be locked and therefore could not
+// be pushed. The lock tag has to be truncated at a budget that leaves room for
+// the prefix, by the same injective scheme, so that distinct refs still get
+// distinct locks.
+func TestLockTagFitsForRefsThatFillTheTagLimit(t *testing.T) {
+	seen := map[string]string{}
+	for _, n := range []int{125, 126, 127, 128} {
+		// "refs/heads/" + n bytes of name encodes to n bytes, since the
+		// prefix is dropped and the name is already legal tag content.
+		for _, variant := range []string{"a", "b"} {
+			ref := "refs/heads/" + strings.Repeat(variant, n)
+			encoded := EncodeRefTag(ref)
+			if len(encoded) < 125 || len(encoded) > maxTagLength {
+				t.Fatalf("test setup: %q encodes to %d bytes, want 125..128", ref, len(encoded))
+			}
+			if strings.HasPrefix(encoded, nsTruncated) {
+				t.Fatalf("test setup: the ref tag for %q should not itself be truncated", ref)
+			}
+
+			tag := LockTag(ref)
+			if len(tag) > maxTagLength {
+				t.Errorf("LockTag(%q) is %d bytes, over the %d-byte tag limit", ref, len(tag), maxTagLength)
+			}
+			if !ociTagPattern.MatchString(tag) {
+				t.Errorf("LockTag(%q) = %q is not a legal OCI tag", ref, tag)
+			}
+			if !strings.HasPrefix(tag, LockTagPrefix+nsTruncated) {
+				t.Errorf("LockTag(%q) = %q should be marked as truncated", ref, tag)
+			}
+			if other, dup := seen[tag]; dup {
+				t.Errorf("refs %q and %q share the lock tag %q", other, ref, tag)
+			}
+			seen[tag] = ref
+		}
+	}
+
+	// A ref that fits the smaller budget keeps the tag it always had, so
+	// nothing changes for the refs that could be locked before.
+	short := "refs/heads/feature/login"
+	if got, want := LockTag(short), LockTagPrefix+EncodeRefTag(short); got != want {
+		t.Errorf("LockTag(%q) = %q, want %q", short, got, want)
 	}
 }

@@ -61,10 +61,20 @@ const LockTagPrefix = "_lock_"
 
 // LockTag returns the OCI tag name for a given ref lock.
 //
-// It uses the same injective encoding as ref manifests, so two different refs
-// cannot end up sharing one lock, under a prefix no ref can reach.
+// It uses the same encoding as ref manifests -- injective, except that the
+// truncated form for over-long refs is collision-resistant rather than
+// guaranteed distinct (§3.1) -- so two different refs do not end up sharing one
+// lock, under a prefix no ref can reach.
+//
+// The encoding is given a budget of maxTagLength less the prefix, so that the
+// whole tag fits the OCI limit (FORMAT.md §9). EncodeRefTag alone may use all
+// 128 bytes, and prefixing that produced a tag the registry rejected: the lock
+// could not be taken, so the ref could not be pushed at all. A ref whose
+// encoding fits the smaller budget gets exactly the tag it always did; one that
+// does not is truncated by the §3.1 scheme at the smaller budget, which keeps
+// distinct refs on distinct locks.
 func LockTag(refName string) string {
-	encoded := EncodeRefTag(refName)
+	encoded := encodeRefTagWithin(refName, maxTagLength-len(LockTagPrefix))
 	if encoded == "" {
 		encoded = "default"
 	}
@@ -91,18 +101,12 @@ func (c *Client) IsLocked(ctx context.Context, refName string) (bool, *LockInfo,
 // round-tripping through IsLocked, because the text after the prefix is the
 // *encoded* ref, and re-encoding it would name a different tag.
 func (c *Client) lockStateByTag(ctx context.Context, tag string) (bool, *LockInfo, error) {
-	_, rc, err := c.Repo.FetchReference(ctx, tag)
+	_, data, err := c.fetchManifestBytes(ctx, tag, "a lock manifest")
 	if err != nil {
 		if IsNotFound(err) {
 			return false, nil, nil
 		}
 		return false, nil, fmt.Errorf("failed to read lock %s: %w", tag, err)
-	}
-	defer func() { _ = rc.Close() }()
-
-	data, err := readMetadataBlob(rc, 0, "a lock manifest")
-	if err != nil {
-		return false, nil, fmt.Errorf("failed to read lock manifest %s: %w", tag, err)
 	}
 
 	var manifest ocispec.Manifest
@@ -258,7 +262,9 @@ func (c *Client) AcquireRefLock(ctx context.Context, refName string, ttl time.Du
 
 	c.heldLocks.Store(refName, lockID)
 	acquired = true
-	c.manifestCache.Store(tag, &lockManifest)
+	// Deliberately not cached: a lock is read fresh every time, both by
+	// lockStateByTag and through the transport's no-cache marking, so a cached
+	// copy would only ever be stale.
 	return lockInfo, nil
 }
 
@@ -282,8 +288,20 @@ func (c *Client) releaseRefLock(ctx context.Context, refName string, force bool)
 	tag := LockTag(refName)
 
 	if !force {
-		if err := c.verifyLockOwnership(ctx, refName); err != nil {
+		live, err := c.verifyLockOwnership(ctx, refName)
+		if err != nil {
 			return err
+		}
+		if !live {
+			// Nothing of ours is published: the lock is absent, was released
+			// already, or expired. Writing the tombstone anyway used to be the
+			// bug here — this client's lock had expired, another client had
+			// legitimately taken the ref, and the tombstone overwrote *their*
+			// lock. With nothing to release there is nothing to write; only
+			// the in-process bookkeeping needs clearing.
+			c.heldLocks.Delete(refName)
+			c.InvalidateManifestCache(tag)
+			return nil
 		}
 	}
 
@@ -341,27 +359,38 @@ func (c *Client) releaseRefLock(ctx context.Context, refName string, force bool)
 	return nil
 }
 
-// verifyLockOwnership refuses to release a lock this client does not hold.
-func (c *Client) verifyLockOwnership(ctx context.Context, refName string) error {
+// verifyLockOwnership reports whether the lock currently published for refName
+// is a live one that this client holds.
+//
+// live is false, with no error, when there is no live lock at all — absent,
+// released or expired — which a release treats as nothing to do. An error means
+// there *is* a live lock and it is not ours, or the state could not be read.
+func (c *Client) verifyLockOwnership(ctx context.Context, refName string) (live bool, err error) {
 	locked, info, err := c.IsLocked(ctx, refName)
 	if err != nil {
-		return fmt.Errorf("failed to verify lock ownership for %s: %w", refName, err)
+		return false, fmt.Errorf("failed to verify lock ownership for %s: %w", refName, err)
 	}
 	if !locked || info == nil {
-		// Already released or expired: releasing again is a no-op, not an error.
-		return nil
+		return false, nil
 	}
 
 	held, ok := c.heldLocks.Load(refName)
 	if !ok || held == lockReserved {
 		// lockReserved means an acquisition is still in flight, so no id has
 		// been published for this client yet.
-		return fmt.Errorf("refusing to release lock on %s held by %s: this client does not hold it", refName, info.Owner)
+		return false, fmt.Errorf("refusing to release lock on %s held by %s: this client does not hold it", refName, info.Owner)
 	}
-	if heldID, _ := held.(string); heldID != "" && info.LockID != "" && heldID != info.LockID {
-		return fmt.Errorf("refusing to release lock on %s: it was taken over by %s", refName, info.Owner)
+	// A published lock with no id cannot be shown to be ours, so it is treated
+	// as someone else's: the id is the only evidence there is, and "no
+	// evidence" used to pass, which let any client release any id-less lock.
+	if heldID, _ := held.(string); info.LockID == "" || heldID != info.LockID {
+		// The ref moved on without us — our lock expired and another client
+		// took it. Forgetting our stale id is what lets this client acquire
+		// the ref again later: AcquireRefLock refuses while an entry exists.
+		c.heldLocks.Delete(refName)
+		return false, fmt.Errorf("refusing to release lock on %s: it was taken over by %s", refName, info.Owner)
 	}
-	return nil
+	return true, nil
 }
 
 // AcquireRefLockWithRetry attempts to acquire a lock on refName, retrying until
