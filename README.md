@@ -71,7 +71,7 @@ Bug reports and pull requests are welcome.
 - 📦 **Commits as OCI Images**: Each pushed ref publishes an OCI Image manifest for its tip commit, tagged with both the commit SHA and the encoded ref name (`refs/heads/*`, `refs/tags/*`). Commits between one push and the next are carried inside the packfile rather than tagged individually.
 - ⚡ **Thin, Incremental Packfiles**: A push omits objects the registry already serves *and* stores what remains as deltas against them, so a small change to a large file costs the change rather than the file — measured at 1.3 KB for a seven-byte edit to a 512 KB file, against 316 KB without.
 - 🧭 **Recorded Pack Bases**: That is safe only because each push records exactly which commits it was cut against, in `io.git-remote-oci.pack-bases`. Fetch follows that list, imports the bases first, and fails loudly if one is unavailable, rather than producing a repository that is quietly missing objects.
-- 🪶 **Optional cheap `--depth 1` clones**: with `ociremote.shallowSnapshot` enabled, each push also publishes a self-contained snapshot of the ref tip, so a shallow clone fetches that one packfile instead of the history behind it — 0.5 MB against 4.4 MB on the benchmark fixture. Off by default, because it costs a full copy of the tip on every push.
+- 🪶 **Optional cheap `--depth 1` clones**: with `ociremote.shallowSnapshot` enabled, each push also publishes a self-contained snapshot of the ref tip, so a shallow clone over the simple path (`ociremote.protocolV2=false`) fetches that one packfile instead of the history behind it — 0.5 MB against 4.4 MB on the benchmark fixture. Off by default, because it costs a full copy of the tip on every push; the default [protocol v2](#protocol-v2) path does not read snapshots and applies the depth when it builds the pack instead.
 - 🧹 **Compaction that happens by itself**: every push publishes a commit manifest and a commit tag that nothing can remove until the history is repacked, so a busy repository gets slower to clone forever. Once `ociremote.compactAfter` commits (50) have accumulated, the push that crosses the line repacks each ref into one self-contained packfile and prunes what is no longer needed. It runs after the push has reported its result and never fails it.
 - ⏸️ **Resumable pushes**: a packfile over 32 MB is uploaded in chunks, so a connection dropped at 90% of a multi-gigabyte push costs one chunk rather than the whole transfer — the registry is asked how much it already holds and the upload continues from there. Registries that do not support chunked uploads fall back to a single request before any content is sent, so a push can never fail for having tried.
 - ⛓️ **One round trip for the pack graph**: pack bases form a chain — each push cut against the one before it — so discovering it from the manifests was one sequential request per push before any packfile moved. The whole graph is published on the `_refs` index that every operation reads anyway, so a clone resolves it in a single parallel wave. It stays advisory: each manifest's own `pack-bases` is still read, so a stale or absent chain costs round trips and never correctness.
@@ -108,7 +108,7 @@ What *does* work is under [Features](#features), and the format is specified in
 | :--- | :--- |
 | **`want`/`have` negotiation** | There is nobody to negotiate with. The *pusher* has to guess what a future fetcher will already have, which is what `io.git-remote-oci.pack-bases` records, and what crosses the wire is whole packfiles as they were cut at push time. Over [protocol v2](#protocol-v2) git is still handed a pack built for its request — the helper stages those packfiles locally and cuts the slice itself — so the negotiation happens on your machine, after the download, rather than being saved by it. |
 | **Partial clone** (`--filter=blob:none`, `blob:limit=<n>`) | Not a storage problem: a blob-less pack could be published beside the full one for a few hundred bytes, and git would reject it. A remote helper's `fetch` is *defined* as transferring a complete object graph and git verifies that. It needs wire protocol v2, which a helper can only speak through `stateless-connect` — so it works, and is on by default. With [`ociremote.protocolV2`](#protocol-v2) turned off, `--filter` merely skips automatic Git LFS downloads. |
-| **Shallow clone** (`--depth <n>`) | Cutting a pack at a boundary the client names needs server-side compute. A registry can only serve a shape prepared in advance, which is why `--depth 1` can be cheap — the tip snapshot is published at push time, if `ociremote.shallowSnapshot` is on — and no other depth can. [Protocol v2](#protocol-v2), which is on by default, lifts this: there the depth is applied when the pack is built. See [Shallow clones](#5-shallow-clones). |
+| **Shallow clone** (`--depth <n>`) | Cutting a pack at a boundary the client names needs server-side compute. A registry can only serve a shape prepared in advance, which is why `--depth 1` can be cheap on the simple path — the tip snapshot is published at push time, if `ociremote.shallowSnapshot` is on — and no other depth can. [Protocol v2](#protocol-v2), which is on by default, lifts this: there the depth is applied when the pack is built. See [Shallow clones](#5-shallow-clones). |
 | **Reachability checks on push** | `git receive-pack` refuses a push whose objects do not connect. A registry accepts any blob you upload and validates nothing, which is exactly why a reader must treat a missing pack base as a hard error rather than a warning. |
 | **`--atomic`** | No transactions. Ref tags are written independently, so the closest achievable is to write `_refs` once at the end and re-point the tags on failure. The visible state does not move, but that is a compensating action: a reader between the two steps sees the intermediate state, and uploaded manifests and blobs stay behind as garbage. |
 | **`--force-with-lease`, ref locking** | Both are compare-and-swap, and the distribution API has none — no `If-Match` on a tag PUT. Check and write are separate requests, so another client can slip between them. A digest check on `_refs` catches the interleaving that actually loses data; locks are advisory, and a client that dies mid-push blocks a ref until the 10-minute TTL expires. |
@@ -128,9 +128,9 @@ What *does* work is under [Features](#features), and the format is specified in
 ## Installation
 
 ### Prerequisites
-- Go 1.26 or later (see the `go` directive in `go.mod`)
-- `git` on your `PATH` — the helper shells out to it for `pack-objects` when pushing, and
-  `index-pack`, `unpack-objects` and `rev-list` when fetching
+- Go 1.27.1 or later (see the `go` directive in `go.mod`)
+- `git` on your `PATH` — the helper shells out to it for `pack-objects` when pushing,
+  `index-pack` and `unpack-objects` when fetching, and `git config` to read its settings
 
 ### With `go install`
 
@@ -285,9 +285,10 @@ git clone oci://ghcr.io/your-username/my-repo
 git fetch origin
 ```
 
-> `--depth` is honoured in what git shows you — `--depth 3` gives exactly three commits — but the
-> full history is still transferred, and `--filter` only skips Git LFS blobs. Neither saves
-> bandwidth on Git objects. See [Limitations](#limitations).
+> Over [protocol v2](#protocol-v2), the default, `--depth n` and `--filter` are applied when the
+> pack is built. With `ociremote.protocolV2=false`, `--depth` is honoured in what git shows you —
+> `--depth 3` gives exactly three commits — but the full history is still transferred, and
+> `--filter` only skips Git LFS blobs. See [Limitations](#limitations).
 
 ### 3. Maintenance
 
@@ -333,9 +334,6 @@ and currently reports 24 tags before and 12 after for its own fixture.
 On a registry that permits manifest deletion, `gc` reclaims the tags it prunes. On one that refuses —
 GHCR, ECR and Docker Hub all do, to varying degrees — the consolidation still happens and the tags it
 could not remove are reported, rather than the whole run failing and throwing the consolidation away.
-
-It refuses to run if any remote ref points at a commit missing from the local clone, rather than
-silently repacking a truncated history.
 
 Two more subcommands help when something has gone wrong:
 
@@ -415,8 +413,13 @@ read.
 
 ### 5. Shallow clones
 
-By default `git clone --depth 1` shows one commit but transfers the whole history. The depth is
-honoured for what git displays; it saves no bandwidth.
+This section is about the *simple* path, `ociremote.protocolV2=false`. Over
+[protocol v2](#protocol-v2), which is the default, the depth is applied when the pack is built and the
+snapshot described here plays no part; see [Protocol v2](#protocol-v2) for what that path costs
+instead.
+
+On the simple path `git clone --depth 1` shows one commit but transfers the whole history. The depth
+is honoured for what git displays; it saves no bandwidth.
 
 That is not laziness, it is the shape of the storage. A shallow clone needs the boundary commit's
 **complete tree**, and the stored packfiles are incremental — a file untouched since the first commit
@@ -691,7 +694,7 @@ between the first blob and the last.
 `git-remote-oci` automatically resolves authentication credentials in order of priority:
 
 1. **Environment Variables**: `OCI_BEARER_TOKEN`, `OCI_USERNAME`, and `OCI_PASSWORD`.
-2. **Docker Config & Credential Helpers**: Reads `~/.docker/config.json` and invokes native credential helpers (such as `docker-credential-gcloud`, `docker-credential-ecr-login`, `docker-credential-desktop`, `docker-credential-pass`).
+2. **Docker Config & Credential Helpers**: Reads `~/.docker/config.json`, including the native credential helpers it names under `credsStore` and `credHelpers` (such as `docker-credential-gcloud`, `docker-credential-ecr-login`, `docker-credential-desktop`, `docker-credential-pass`). This is oras-go's credential store, not code of this project's, and the test suite covers the config file but does not exercise a helper.
 3. **Anonymous Fallback**: Unauthenticated access for public registries.
 
 ---
@@ -706,8 +709,9 @@ make help       # list all targets
 make build      # build the binary
 make test       # unit tests with the race detector
 make cover      # unit tests with a coverage profile
-make lint       # golangci-lint (config: .golangci.yml)
-make check      # everything CI runs on a pull request
+make fuzz       # a short run of every fuzz target
+make lint       # golangci-lint, at the version pinned in the Makefile (config: .golangci.yml)
+make check      # everything CI runs on a pull request: fmt-check, tidy-check, vet, lint, test, vulncheck
 
 make vulncheck  # govulncheck: vulnerabilities reachable from this code
 make e2e        # end-to-end tests against a real registry:3 container (needs Docker)
@@ -747,8 +751,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide and
 - Run `make check` before opening a pull request.
 - Do not add a feature to the README until it is implemented and covered by a test. If the README
   and the code disagree, the code is the truth.
-- A change to the on-registry layout must bump `oci.FormatVersion` and update [FORMAT.md](FORMAT.md)
-  in the same commit.
+- A change to the on-registry layout is a format change: update [FORMAT.md](FORMAT.md) in the same
+  commit. Bump `oci.FormatVersion` only when a reader that does not know about the change would
+  misread a repository — [FORMAT.md §11](FORMAT.md#11-changing-the-format) says when.
 
 ---
 
