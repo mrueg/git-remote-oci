@@ -8,15 +8,14 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
-// blobFetches counts packfile blob downloads the registry served.
-func blobFetches(reg *mockRegistry) int {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
+// blobFetches counts the packfile blob downloads among the given requests.
+func blobFetches(requests []string) int {
 	n := 0
-	for _, req := range reg.requests {
+	for _, req := range requests {
 		if strings.HasPrefix(req, "GET ") && strings.Contains(req, "/blobs/") {
 			n++
 		}
@@ -53,9 +52,8 @@ func shallowFixture(t *testing.T, registry string, generations int) string {
 // multi-commit push - or any depth above 1 - truncated in the wrong place. It is
 // now computed from the real commit graph once everything has been imported.
 func TestShallowDepthTruncatesAtTheRequestedCommit(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -90,9 +88,8 @@ func TestShallowDepthTruncatesAtTheRequestedCommit(t *testing.T) {
 // has - that pointed at a directory which does not exist, so the boundary was
 // never written and the repository was not shallow at all.
 func TestShallowBoundaryIsWrittenInABareRepository(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -126,9 +123,8 @@ func TestShallowBoundaryIsWrittenInABareRepository(t *testing.T) {
 // exactly the objects reachable from the tip, with no ancestry — and taking it
 // is what makes --depth 1 cheap.
 func TestShallowCloneFetchesOnlyTheSnapshot(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -138,13 +134,11 @@ func TestShallowCloneFetchesOnlyTheSnapshot(t *testing.T) {
 	measure := func(script string) int {
 		dst := newBareRepo(t)
 		t.Setenv("GIT_DIR", dst)
-		reg.mu.Lock()
-		reg.requests = nil
-		reg.mu.Unlock()
+		mark := len(reg.Requests())
 		if out, err := runHelper(t, registry, script); err != nil {
 			t.Fatalf("fetch failed: %v (output %q)", err, out)
 		}
-		return blobFetches(reg)
+		return blobFetches(reg.Requests()[mark:])
 	}
 
 	full := measure("list\nfetch " + tip + " refs/heads/main\n\n")
@@ -165,9 +159,8 @@ func TestShallowCloneFetchesOnlyTheSnapshot(t *testing.T) {
 // TestShallowCloneIsCompleteAtTheBoundary: cheaper is worthless if the result
 // does not check out. The snapshot must carry the tip's whole tree.
 func TestShallowCloneIsCompleteAtTheBoundary(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -200,9 +193,8 @@ func TestShallowCloneIsCompleteAtTheBoundary(t *testing.T) {
 // still works: it walks the packfiles as it always did and produces a correct,
 // checkoutable repository.
 func TestShallowSnapshotIsOffByDefault(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")

@@ -1,45 +1,13 @@
 package helper_test
 
 import (
-	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/mrueg/git-remote-oci/pkg/oci"
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
-
-// rewritePackBases points a tag's pack-bases annotation at the given commits.
-//
-// Registry content is untrusted, so this is a registry doing something a
-// correct one never would — which is exactly the case a fetch has to survive.
-func rewritePackBases(t *testing.T, reg *mockRegistry, tag string, bases ...string) {
-	t.Helper()
-
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
-	raw, ok := reg.manifests[tag]
-	if !ok {
-		t.Fatalf("mock registry has no manifest tagged %q", tag)
-	}
-	var m ocispec.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("unmarshal manifest %q: %v", tag, err)
-	}
-	if m.Annotations == nil {
-		m.Annotations = map[string]string{}
-	}
-	m.Annotations[oci.AnnotationGitPackBases] = strings.Join(bases, ",")
-	out, err := json.Marshal(m)
-	if err != nil {
-		t.Fatalf("marshal manifest %q: %v", tag, err)
-	}
-	reg.manifests[tag] = out
-}
 
 // fetchWithinTimeout runs a fetch and fails if it does not return.
 //
@@ -78,9 +46,8 @@ func fetchWithinTimeout(t *testing.T, registry, script string, within time.Durat
 // Resolving the graph before importing turns that into a graph property, found
 // by inspection instead of by hanging.
 func TestSelfReferentialPackBaseFailsRatherThanHanging(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -92,8 +59,8 @@ func TestSelfReferentialPackBaseFailsRatherThanHanging(t *testing.T) {
 		t.Fatalf("push failed: %v (output %q)", err, out)
 	}
 
-	rewritePackBases(t, reg, tip, tip)
-	rewritePackBases(t, reg, "main", tip)
+	reg.SetPackBases(t, tip, tip)
+	reg.SetPackBases(t, "main", tip)
 
 	dst := newBareRepo(t)
 	t.Setenv("GIT_DIR", dst)
@@ -112,9 +79,8 @@ func TestSelfReferentialPackBaseFailsRatherThanHanging(t *testing.T) {
 // cannot, and is why the fix is a topological sort rather than an equality
 // test.
 func TestMutualPackBaseCycleFailsRatherThanHanging(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -131,7 +97,7 @@ func TestMutualPackBaseCycleFailsRatherThanHanging(t *testing.T) {
 	}
 
 	// tip -> first is genuine; first -> tip closes the loop.
-	rewritePackBases(t, reg, first, tip)
+	reg.SetPackBases(t, first, tip)
 
 	dst := newBareRepo(t)
 	t.Setenv("GIT_DIR", dst)

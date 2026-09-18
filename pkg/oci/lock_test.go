@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 func TestRefLocking(t *testing.T) {
-	mock := newMockRegistry()
-	server := mock.Server()
-	defer server.Close()
+	mock := registrytest.New()
+	server := mock.Serve(t)
 
 	u, err := url.Parse(server.URL)
 	if err != nil {
@@ -86,9 +86,8 @@ func TestRefLocking(t *testing.T) {
 // The registry grants one holder per ref, so the second acquisition was never
 // legitimate; it is refused rather than allowed to overwrite.
 func TestSecondInProcessAcquireIsRefused(t *testing.T) {
-	mock := newMockRegistry()
-	server := mock.Server()
-	defer server.Close()
+	mock := registrytest.New()
+	server := mock.Serve(t)
 
 	u, err := url.Parse(server.URL)
 	if err != nil {
@@ -130,9 +129,8 @@ func TestSecondInProcessAcquireIsRefused(t *testing.T) {
 // reservation back, or one transient registry error would make the ref
 // permanently unlockable by this process.
 func TestFailedAcquireDoesNotWedgeTheRef(t *testing.T) {
-	mock := newMockRegistry()
-	server := mock.Server()
-	defer server.Close()
+	mock := registrytest.New()
+	server := mock.Serve(t)
 
 	u, err := url.Parse(server.URL)
 	if err != nil {

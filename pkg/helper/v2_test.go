@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
 // End-to-end coverage for wire protocol v2, served over stateless-connect.
@@ -70,7 +72,7 @@ func v2setup(t *testing.T) string {
 }
 
 // v2setupRegistry is v2setup for tests that assert on what crossed the wire.
-func v2setupRegistry(t *testing.T) (string, *mockRegistry) {
+func v2setupRegistry(t *testing.T) (string, *registrytest.Registry) {
 	t.Helper()
 	binDir := t.TempDir()
 	bin := filepath.Join(binDir, "git-remote-oci")
@@ -80,10 +82,8 @@ func v2setupRegistry(t *testing.T) (string, *mockRegistry) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("OCI_INSECURE", "1")
 	instrumentSubprocessCoverage(t)
-	reg := newMockRegistry()
-	ts := reg.Server()
-	t.Cleanup(ts.Close)
-	return "oci://" + strings.TrimPrefix(ts.URL, "http://") + "/test-repo", reg
+	reg := registrytest.New()
+	return registrytest.URL(reg.Serve(t)), reg
 }
 
 func v2run(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
@@ -1097,8 +1097,8 @@ func TestV2ObjectInfoAnswersWithoutFetchingAPackfile(t *testing.T) {
 	dst := filepath.Join(parent, "dst")
 	t.Setenv("GIT_DIR", filepath.Join(dst, ".git"))
 
-	packfile := reg.packfileLayerOf(t, "refs/heads/main")
-	mark := reg.requestMark()
+	packfile := packfileLayerOf(t, reg, "refs/heads/main")
+	mark := len(reg.Requests())
 
 	script := "stateless-connect git-upload-pack\n" +
 		pktLine("command=object-info\n") +
@@ -1116,7 +1116,7 @@ func TestV2ObjectInfoAnswersWithoutFetchingAPackfile(t *testing.T) {
 		t.Fatalf("object-info did not report %s as %d bytes:\n%q", blob, size, out)
 	}
 
-	for _, req := range reg.requestsSince(mark) {
+	for _, req := range reg.Requests()[mark:] {
 		if strings.HasPrefix(req, "GET ") && strings.HasSuffix(req, "/blobs/"+packfile) {
 			t.Errorf("object-info downloaded the packfile to answer a size question; " +
 				"the size is published in the index precisely so it need not")

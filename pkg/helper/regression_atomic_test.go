@@ -7,18 +7,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 // refTagRevision reads the commit a ref tag currently resolves to.
-func refTagRevision(t *testing.T, reg *mockRegistry, refName string) (string, bool) {
+func refTagRevision(t *testing.T, reg *registrytest.Registry, refName string) (string, bool) {
 	t.Helper()
 
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
-	raw, ok := reg.manifests[oci.EncodeRefTag(refName)]
+	raw, ok := reg.ManifestBytes(oci.EncodeRefTag(refName))
 	if !ok {
 		return "", false
 	}
@@ -38,9 +37,8 @@ func refTagRevision(t *testing.T, reg *mockRegistry, refName string) (string, bo
 // ref tags resolved to the new ones - and the next push then ran its
 // fast-forward check against a ref that had only half moved.
 func TestAtomicPushRollsBackRefTagsOnFailure(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -72,15 +70,13 @@ func TestAtomicPushRollsBackRefTagsOnFailure(t *testing.T) {
 	// Fail the *second* ref's manifest write, so the batch stops after the
 	// first has already landed. Only that tag is failed: failing every write
 	// would also break the rollback, which is the thing under test.
-	reg.mu.Lock()
-	reg.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.EncodeRefTag("refs/heads/second")) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return true
 		}
 		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	out, err := runHelper(t, registry,
 		"option atomic true\nlist for-push\npush refs/heads/main:refs/heads/main\npush refs/heads/second:refs/heads/second\n\n")
@@ -91,9 +87,7 @@ func TestAtomicPushRollsBackRefTagsOnFailure(t *testing.T) {
 		t.Fatalf("expected the atomic batch to fail, got:\n%s", out)
 	}
 
-	reg.mu.Lock()
-	reg.intercept = nil
-	reg.mu.Unlock()
+	reg.Intercept(nil)
 
 	// Neither ref tag may be left advanced.
 	for refName, want := range map[string]string{
