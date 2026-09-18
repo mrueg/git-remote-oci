@@ -199,7 +199,17 @@ func tagRefEntry(manifest *ocispec.Manifest) (refName string, entry RefEntry, ok
 	if refName == "" || sha == "" {
 		return "", RefEntry{}, false
 	}
-	return refName, RefEntry{SHA: sha}, true
+	// The annotated-tag fields mirror the ref manifest's annotations (§5, §6),
+	// so they are recoverable from the tag alone. The commit's author,
+	// timestamp and message are not: the manifest does not carry them, and
+	// only the push that wrote the entry ever knew them.
+	return refName, RefEntry{
+		SHA:        sha,
+		Tagger:     manifest.Annotations[AnnotationGitTagger],
+		TagMessage: manifest.Annotations[AnnotationGitTagMessage],
+		TagSig:     manifest.Annotations[AnnotationGitTagSig],
+		TagObject:  manifest.Annotations[AnnotationGitTagObj],
+	}, true
 }
 
 // RefEntry represents cached reference metadata inside the _refs JSON index payload.
@@ -217,30 +227,43 @@ type RefEntry struct {
 // FetchRichRefIndex retrieves the rich ref mapping from the _refs index tag,
 // with automatic fallback to the _index OCI Image Index manifest.
 func (c *Client) FetchRichRefIndex(ctx context.Context) (map[string]RefEntry, error) {
+	refs, err := c.fetchRefsIndexOnly(ctx)
+	if err == nil {
+		return refs, nil
+	}
+	if !IsNotFound(err) {
+		// Only an absent _refs is stood in for. Falling back on any
+		// failure, as this used to, turned a momentary 5xx on _refs into a
+		// read of _index -- which is a mirror that a failed push can leave
+		// stale, and which then became the base of the caller's
+		// read-modify-write.
+		return nil, fmt.Errorf("failed to fetch _refs index manifest: %w", err)
+	}
+	// _index carries the same ref set and is written alongside _refs, so it
+	// stands in when _refs is missing. It is not a legacy path: both are
+	// current, and FetchOCIImageIndexRefs applies the same version check.
+	ociRefs, ociErr := c.FetchOCIImageIndexRefs(ctx, TagOCIIndex)
+	switch {
+	case ociErr == nil && len(ociRefs) > 0:
+		return ociRefs, nil
+	case ociErr != nil && !IsNotFound(ociErr):
+		// A mirror that exists but cannot be read -- a refused format
+		// version, say -- is reported as such, not as a missing index.
+		return nil, fmt.Errorf("_refs is missing and the _index mirror could not be read: %w", ociErr)
+	}
+	return nil, fmt.Errorf("failed to fetch _refs index manifest: %w", err)
+}
+
+// fetchRefsIndexOnly reads what the _refs tag itself publishes, and nothing
+// else: an absent _refs is reported as not found rather than stood in for by
+// the _index mirror. FetchRichRefIndex is the read every operation wants; this
+// is for the repair path, whose question is what _refs says, not what a reader
+// would be served.
+func (c *Client) fetchRefsIndexOnly(ctx context.Context) (map[string]RefEntry, error) {
 	c.manifestCache.Delete(TagRefIndex)
 	manifest, err := c.FetchManifest(ctx, TagRefIndex)
 	if err != nil {
-		if !IsNotFound(err) {
-			// Only an absent _refs is stood in for. Falling back on any
-			// failure, as this used to, turned a momentary 5xx on _refs into a
-			// read of _index -- which is a mirror that a failed push can leave
-			// stale, and which then became the base of the caller's
-			// read-modify-write.
-			return nil, fmt.Errorf("failed to fetch _refs index manifest: %w", err)
-		}
-		// _index carries the same ref set and is written alongside _refs, so it
-		// stands in when _refs is missing. It is not a legacy path: both are
-		// current, and FetchOCIImageIndexRefs applies the same version check.
-		ociRefs, ociErr := c.FetchOCIImageIndexRefs(ctx, TagOCIIndex)
-		switch {
-		case ociErr == nil && len(ociRefs) > 0:
-			return ociRefs, nil
-		case ociErr != nil && !IsNotFound(ociErr):
-			// A mirror that exists but cannot be read -- a refused format
-			// version, say -- is reported as such, not as a missing index.
-			return nil, fmt.Errorf("_refs is missing and the _index mirror could not be read: %w", ociErr)
-		}
-		return nil, fmt.Errorf("failed to fetch _refs index manifest: %w", err)
+		return nil, err
 	}
 
 	// The _refs index is the first thing every operation reads, which makes it
@@ -666,30 +689,43 @@ func (c *Client) SetHead(ctx context.Context, ref string) (previous string, err 
 // branch should be, and silently retargeting it on every push would be worse
 // than leaving it alone.
 func (c *Client) PushRichRefIndexWithHead(ctx context.Context, refs map[string]RefEntry, deleted map[string]bool, headHint string) error {
-	// Read-modify-write under optimistic concurrency control.
-	//
-	// The digest check is what protects the data, not the lock. A registry
-	// offers no compare-and-swap, so lock acquisition is itself check-then-write
-	// and two clients can both believe they hold it. Comparing the index digest
-	// from before the merge against the digest immediately before the write
-	// catches the case that actually loses data — another client updating _refs
-	// while this one was busy merging — and retries against fresh state instead
-	// of overwriting them.
-	//
-	// Because the digest check is the real guard, the merge is computed
-	// *outside* the lock and the lock covers only the re-check and the write.
-	// The merge is the expensive half: it re-reads the index with its own
-	// retries and enumerates every tag in the repository, which on a wide
-	// repository over a slow link took long enough to routinely outlast the
-	// lock's TTL — and a lock that expires mid-update is worse than no lock,
-	// because the next client acquires it legitimately and the two interleave
-	// exactly the update the lock exists to serialise. Anything that changes
-	// while the merge runs unlocked is caught by the re-check under the lock.
-	//
-	// Retrying converges: each attempt re-reads whatever is on the registry and
-	// layers this push's refs on top, so concurrent updates to *different* refs
-	// all survive. Concurrent updates to the *same* ref are still last-writer-
-	// wins, but they are no longer silent.
+	return c.updateRefIndex(ctx, headHint, func(context.Context, map[string]RefEntry) (map[string]RefEntry, map[string]bool, error) {
+		return refs, deleted, nil
+	})
+}
+
+// refIndexPlan decides what one attempt at an index update changes, given the
+// published index it will be layered on. A push's plan is constant -- the refs
+// it moved -- while a repair's is recomputed on every attempt, because what it
+// changes depends on the state it finds.
+type refIndexPlan func(ctx context.Context, published map[string]RefEntry) (refs map[string]RefEntry, deleted map[string]bool, err error)
+
+// updateRefIndex is the one path that writes _refs: read-modify-write under
+// optimistic concurrency control, with the index lock covering the write.
+//
+// The digest check is what protects the data, not the lock. A registry
+// offers no compare-and-swap, so lock acquisition is itself check-then-write
+// and two clients can both believe they hold it. Comparing the index digest
+// from before the merge against the digest immediately before the write
+// catches the case that actually loses data — another client updating _refs
+// while this one was busy merging — and retries against fresh state instead
+// of overwriting them.
+//
+// Because the digest check is the real guard, the merge is computed
+// *outside* the lock and the lock covers only the re-check and the write.
+// The merge is the expensive half: it re-reads the index with its own
+// retries and enumerates every tag in the repository, which on a wide
+// repository over a slow link took long enough to routinely outlast the
+// lock's TTL — and a lock that expires mid-update is worse than no lock,
+// because the next client acquires it legitimately and the two interleave
+// exactly the update the lock exists to serialise. Anything that changes
+// while the merge runs unlocked is caught by the re-check under the lock.
+//
+// Retrying converges: each attempt re-reads whatever is on the registry and
+// layers the plan's refs on top, so concurrent updates to *different* refs
+// all survive. Concurrent updates to the *same* ref are still last-writer-
+// wins, but they are no longer silent.
+func (c *Client) updateRefIndex(ctx context.Context, headHint string, plan refIndexPlan) error {
 	var lastConflict error
 	for attempt := 1; attempt <= refsIndexMaxAttempts; attempt++ {
 		baseline, baseErr := c.refIndexDigest(ctx)
@@ -697,10 +733,15 @@ func (c *Client) PushRichRefIndexWithHead(ctx context.Context, refs map[string]R
 			return fmt.Errorf("failed to read the _refs index state: %w", baseErr)
 		}
 
-		remoteRefs, mergeErr := c.mergeRemoteRefs(ctx, refs, deleted)
-		if mergeErr != nil {
-			return mergeErr
+		published, readErr := c.readPublishedRefs(ctx)
+		if readErr != nil {
+			return readErr
 		}
+		refs, deleted, planErr := plan(ctx, published)
+		if planErr != nil {
+			return planErr
+		}
+		remoteRefs := overlayRefs(published, refs, deleted)
 
 		head, headErr := c.currentHead(ctx)
 		if headErr != nil {
@@ -725,7 +766,7 @@ func (c *Client) PushRichRefIndexWithHead(ctx context.Context, refs map[string]R
 			// The write landed, but the lock was shared with another client
 			// for the whole of it, so theirs may have landed on top. The
 			// published index is the only thing that can say. If every entry
-			// this push wrote is there, the write is durable and the lock
+			// this update wrote is there, the write is durable and the lock
 			// never mattered; if not, this goes round again and re-merges on
 			// top of whatever they left, as it would for any other conflict.
 			// Reporting the ref as not visible here, as this used to, was
@@ -865,13 +906,39 @@ const mergeRemoteRefsAttempts = 5
 // published -- the caller has just written the ref manifest and is the
 // authority on where the ref now points -- which is exactly why refs must hold
 // only the refs this writer changed (see PushRichRefIndexWithHead).
+func (c *Client) mergeRemoteRefs(ctx context.Context, refs map[string]RefEntry, deleted map[string]bool) (map[string]RefEntry, error) {
+	published, err := c.readPublishedRefs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return overlayRefs(published, refs, deleted), nil
+}
+
+// overlayRefs applies a set of overrides and deletions to a copy of published.
+func overlayRefs(published, refs map[string]RefEntry, deleted map[string]bool) map[string]RefEntry {
+	merged := make(map[string]RefEntry, len(published)+len(refs))
+	for k, v := range published {
+		merged[k] = v
+	}
+	for k, v := range refs {
+		merged[k] = v
+	}
+	for name := range deleted {
+		delete(merged, name)
+	}
+	return merged
+}
+
+// readPublishedRefs reads the refs a writer must layer its change on: the
+// published index, or, for a repository that has none, whatever the tags
+// publish.
 //
 // A base that cannot be read is an error, not an empty map. Proceeding with an
 // empty base, as this used to after its retries ran out, republished the index
 // as just this push's refs: every ref whose tag was truncated (§3.1) and cannot
 // be recovered from tag enumeration was gone, and every other ref lost its
 // author, timestamp and tag metadata.
-func (c *Client) mergeRemoteRefs(ctx context.Context, refs map[string]RefEntry, deleted map[string]bool) (map[string]RefEntry, error) {
+func (c *Client) readPublishedRefs(ctx context.Context) (map[string]RefEntry, error) {
 	var (
 		remoteRefs map[string]RefEntry
 		lastErr    error
@@ -906,21 +973,14 @@ func (c *Client) mergeRemoteRefs(ctx context.Context, refs map[string]RefEntry, 
 		// Without an index, the tags are the only record of what is
 		// published. This is the repair path for a repository whose index was
 		// lost; it cannot see truncated tags, but it recovers everything else.
-		remoteRefs = make(map[string]RefEntry, len(refs))
 		listed, listErr := c.enumerateTagRefs(ctx, false)
 		if listErr != nil {
 			return nil, fmt.Errorf("failed to enumerate the published refs: %w", listErr)
 		}
+		remoteRefs = make(map[string]RefEntry, len(listed))
 		for rName, rSHA := range listed {
 			remoteRefs[rName] = RefEntry{SHA: rSHA}
 		}
-	}
-
-	for k, v := range refs {
-		remoteRefs[k] = v
-	}
-	for name := range deleted {
-		delete(remoteRefs, name)
 	}
 	return remoteRefs, nil
 }

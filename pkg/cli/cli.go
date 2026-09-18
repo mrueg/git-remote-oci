@@ -83,8 +83,8 @@ func init() {
 		},
 		{
 			name:    "fsck",
-			args:    "<oci-url>",
-			summary: "check a published repository is fetchable",
+			args:    "[--repair] <oci-url>",
+			summary: "check a published repository is fetchable; --repair rebuilds _refs from the ref tags",
 			run:     runFsck,
 		},
 		{
