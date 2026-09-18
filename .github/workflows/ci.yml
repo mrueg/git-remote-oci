@@ -16,9 +16,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  GOLANGCI_LINT_VERSION: v2.12.2
-
 jobs:
   hygiene:
     name: Format & Tidy
@@ -52,10 +49,16 @@ jobs:
           go-version-file: 'go.mod'
 
       # Config lives in .golangci.yml; the version is pinned so a new
-      # golangci-lint release cannot red-CI an unrelated pull request.
+      # golangci-lint release cannot red-CI an unrelated pull request. The pin
+      # is GOLANGCI_LINT_VERSION in the Makefile, so `make lint` and this job
+      # run the same binary and there is one place to bump.
+      - name: Read the pinned golangci-lint version
+        id: golangci
+        run: echo "version=$(make -s golangci-lint-version)" >> "$GITHUB_OUTPUT"
+
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          version: ${{ steps.golangci.outputs.version }}
 
   unit-test:
     name: Unit Tests (race + coverage)
@@ -193,3 +196,37 @@ jobs:
 
       - name: Build binary
         run: make build
+
+  release-dry-run:
+    name: Release dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # goreleaser derives the version from tags and refuses a shallow
+          # clone, snapshot or not.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      # .goreleaser.yaml is only ever executed by release.yml, on a tag, which
+      # is the worst moment to learn that a key was renamed or that the darwin
+      # or arm64 cross-compile broke. `check` validates the file against the
+      # goreleaser version that will run it; `build --snapshot` runs the whole
+      # build matrix without publishing, signing or needing cosign and syft.
+      # The same action and SHA as release.yml, so the two cannot disagree on
+      # which goreleaser is being validated against.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          install-only: true
+
+      - name: goreleaser check
+        run: goreleaser check
+
+      - name: goreleaser build (snapshot, full matrix)
+        run: goreleaser build --snapshot --clean

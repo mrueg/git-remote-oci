@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -71,7 +72,7 @@ func authenticatedRegistryArgs(t *testing.T, containerName, authDir string) []st
 }
 
 func TestAuthenticatedRegistryE2E(t *testing.T) {
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	if err := exec.CommandContext(t.Context(), "docker", "info").Run(); err != nil {
 		t.Skip("Skipping authenticated registry E2E test: Docker is not running")
 	}
 
@@ -82,7 +83,7 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 
 	binDir := t.TempDir()
 	binaryPath := filepath.Join(binDir, "git-remote-oci")
-	if out, err := exec.Command("go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build git-remote-oci: %v\n%s", err, out)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -105,15 +106,15 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 	}
 
 	containerName := fmt.Sprintf("git-remote-oci-auth-e2e-%d", time.Now().UnixNano())
-	runOut, err := exec.Command("docker", authenticatedRegistryArgs(t, containerName, authDir)...).CombinedOutput()
+	runOut, err := exec.CommandContext(t.Context(), "docker", authenticatedRegistryArgs(t, containerName, authDir)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to start authenticated registry: %v\n%s", err, runOut)
 	}
 	lines := strings.Split(strings.TrimSpace(string(runOut)), "\n")
 	containerID := strings.TrimSpace(lines[len(lines)-1])
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", containerID).Run() })
+	t.Cleanup(func() { _ = exec.CommandContext(context.Background(), "docker", "rm", "-f", containerID).Run() })
 
-	portOut, err := exec.Command("docker", "port", containerID, "5000").CombinedOutput()
+	portOut, err := exec.CommandContext(t.Context(), "docker", "port", containerID, "5000").CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to get container port: %v\n%s", err, portOut)
 	}
@@ -124,9 +125,13 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 
 	// An authenticated registry answers /v2/ with 401 until credentials are
 	// supplied, so readiness is "responding", not "responding 200".
+	readyReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("http://localhost:%s/v2/", portStr), nil)
+	if err != nil {
+		t.Fatalf("Failed to build readiness request: %v", err)
+	}
 	ready, challenged := false, false
 	for range 100 {
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/", portStr))
+		resp, err := http.DefaultClient.Do(readyReq)
 		if err == nil {
 			code := resp.StatusCode
 			_ = resp.Body.Close()
@@ -160,7 +165,7 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 	remoteURL := fmt.Sprintf("oci://localhost:%s/test-org/private-repo", portStr)
 
 	runGit := func(dir string, env []string, args ...string) (string, error) {
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = append(os.Environ(), env...)
 		out, err := cmd.CombinedOutput()

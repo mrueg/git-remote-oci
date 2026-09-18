@@ -9,8 +9,6 @@ on:
         default: '20000'
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 permissions:
   contents: read
@@ -37,15 +35,13 @@ jobs:
       - name: Pre-pull registry image
         run: docker pull registry:3
 
-      # A pull request gets a small run: enough to catch a change that breaks
-      # the suite or collapses throughput, without spending the better part of
-      # an hour per push. main and the scheduled run get the full size.
+      # This does not run on pull requests: it is an hour of runner time whose
+      # output is a table nobody compares against a baseline, and ci.yml already
+      # proves the suite builds. It runs on every push to main and on demand,
+      # which is where a regression is looked for.
       - name: Run E2E Benchmark Suite
         env:
-          BENCHMARK_COMMITS: >-
-            ${{ github.event.inputs.commits
-                || (github.event_name == 'pull_request' && '2000')
-                || '20000' }}
+          BENCHMARK_COMMITS: ${{ github.event.inputs.commits || '20000' }}
         run: make bench 2>&1 | tee bench.log
 
       # The suite reports with t.Logf, which lands in the raw log and nowhere
@@ -69,7 +65,4 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         env:
-          BENCHMARK_COMMITS: >-
-            ${{ github.event.inputs.commits
-                || (github.event_name == 'pull_request' && '2000')
-                || '20000' }}
+          BENCHMARK_COMMITS: ${{ github.event.inputs.commits || '20000' }}

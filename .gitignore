@@ -1,6 +1,5 @@
 git-remote-oci
 *.test
-test-repo/
 
 # Build and release artifacts
 dist/
@@ -19,3 +18,11 @@ coverage.html
 
 # Raw coverage data, merged into coverage.out by `make cover`.
 .coverdata/
+
+# Scratch copies `make tidy-check` takes and normally removes; left behind if
+# it is interrupted.
+go.mod.tidycheck
+go.sum.tidycheck
+
+# benchmark.yml tees the suite's output here.
+bench.log

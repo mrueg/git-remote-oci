@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -50,7 +51,7 @@ func TestGHCRE2E(t *testing.T) {
 
 	binDir := t.TempDir()
 	binary := filepath.Join(binDir, "git-remote-oci")
-	if out, err := exec.Command("go", "build", "-o", binary, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
 		t.Fatalf("failed to build git-remote-oci: %v\n%s", err, out)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -62,7 +63,7 @@ func TestGHCRE2E(t *testing.T) {
 	}
 	run := func(t *testing.T, dir string, args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = append(os.Environ(), env...)
 		out, err := cmd.CombinedOutput()
@@ -76,14 +77,14 @@ func TestGHCRE2E(t *testing.T) {
 	// broken run does not leave the shared path accumulating branches.
 	t.Cleanup(func() {
 		src := t.TempDir()
-		cmd := exec.Command("git", "init", "-q", "-b", "main", ".")
+		cmd := exec.CommandContext(context.Background(), "git", "init", "-q", "-b", "main", ".")
 		cmd.Dir, cmd.Env = src, append(os.Environ(), env...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Logf("cleanup: git init failed: %v\n%s", err, out)
 			return
 		}
 		for _, ref := range []string{branch, "cleanup-" + suffix} {
-			cmd := exec.Command("git", "push", remoteURL, ":refs/heads/"+ref)
+			cmd := exec.CommandContext(context.Background(), "git", "push", remoteURL, ":refs/heads/"+ref)
 			cmd.Dir, cmd.Env = src, append(os.Environ(), env...)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Logf("cleanup: could not delete %s: %v\n%s", ref, err, out)
@@ -176,7 +177,7 @@ func TestGHCRRejectsBadCredentials(t *testing.T) {
 
 	binDir := t.TempDir()
 	binary := filepath.Join(binDir, "git-remote-oci")
-	if out, err := exec.Command("go", "build", "-o", binary, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
 		t.Fatalf("failed to build git-remote-oci: %v\n%s", err, out)
 	}
 
@@ -193,7 +194,7 @@ func TestGHCRRejectsBadCredentials(t *testing.T) {
 		"DOCKER_CONFIG=" + t.TempDir(),
 	}
 
-	cmd := exec.Command("git", "ls-remote", "oci://"+strings.TrimPrefix(repo, "oci://"))
+	cmd := exec.CommandContext(t.Context(), "git", "ls-remote", "oci://"+strings.TrimPrefix(repo, "oci://"))
 	cmd.Dir = srcDir
 	cmd.Env = append(os.Environ(), base...)
 	out, err := cmd.CombinedOutput()
