@@ -8,12 +8,18 @@ linters:
   enable:
     - bodyclose
     - copyloopvar
+    - durationcheck
     - errorlint
     - gocritic
     - gosec
     - misspell
     - nilerr
+    - noctx
+    - nolintlint
     - revive
+    - thelper
+    - unparam
+    - usetesting
 
   settings:
     errcheck:
@@ -45,9 +51,12 @@ linters:
 
   exclusions:
     generated: lax
+    # Not std-error-handling: that preset waves through an unchecked Close,
+    # and a Close on a write path is where a short write surfaces. The project
+    # rule is that anything indicating data loss is propagated, so those have
+    # to be checked, and the linter is how that is enforced.
     presets:
       - comments
-      - std-error-handling
     rules:
       # Test fixtures write throwaway files into t.TempDir(); permission and
       # subprocess hardening rules add noise without adding safety there.

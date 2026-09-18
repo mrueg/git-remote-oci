@@ -4,7 +4,11 @@ project_name:  git-remote-oci
 
 before:
   hooks:
-    - go mod tidy
+    # verify, not tidy: CI enforces tidiness on every pull request, and a
+    # release that quietly rewrote go.mod would be building something other
+    # than the commit it is tagged with. verify fails instead if the module
+    # cache disagrees with go.sum.
+    - go mod verify
 
 builds:
   - id: git-remote-oci
@@ -105,19 +109,30 @@ kos:
     build: git-remote-oci
     main: .
     working_dir: .
-    # git is not optional: the helper shells out to pack-objects, index-pack and
-    # rev-list. A distroless static base would produce an image that starts and
-    # then fails on the first push, so this uses a base that has git.
-    base_image: cgr.dev/chainguard/git:latest
+    # git is not optional: the helper shells out to pack-objects, index-pack,
+    # unpack-objects and `git config`. A distroless static base would produce
+    # an image that starts and then fails on the first push, so this uses a
+    # base that has git.
+    #
+    # Pinned by digest so a release is reproducible and a base-image change is
+    # a reviewed commit rather than whatever `latest` meant on the day. Nothing
+    # bumps this automatically (dependabot has no ecosystem for it); refresh it
+    # with `crane digest cgr.dev/chainguard/git:latest` and note the date.
+    # Resolved from cgr.dev/chainguard/git:latest on 2026-09-18.
+    base_image: cgr.dev/chainguard/git@sha256:f213f0712f661c1fc771df6ba3f9e7e67407da7b646dae395482ad29c7ff9ba2
     repositories:
       - ghcr.io/mrueg/git-remote-oci
     platforms:
       - linux/amd64
       - linux/arm64
+    # The floating tags are withheld from a prerelease: `latest` and `1.2`
+    # would otherwise move to v1.2.0-rc1 and stay there until the final. An
+    # empty template renders to no tag at all, which is what the conditional
+    # relies on.
     tags:
       - "{{ .Version }}"
-      - "{{ .Major }}.{{ .Minor }}"
-      - latest
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
     # Push by tag rather than by the ko default of an import-path-derived name.
     bare: true
     preserve_import_paths: false
@@ -127,9 +142,26 @@ kos:
       org.opencontainers.image.description: Store git repositories in OCI registries
       org.opencontainers.image.licenses: Apache-2.0
 
+# Conventional Commits are load-bearing here (see AGENTS.md): the prefix is
+# what decides whether a commit is release-note material and which heading it
+# lands under.
 changelog:
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
+      - "^docs"
+      - "^test"
+      - "^chore"
+      - "^ci"
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Bug fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Performance
+      regexp: '^perf(\(.+\))?!?:'
+      order: 2
+    - title: Other
+      order: 999

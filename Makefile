@@ -16,6 +16,13 @@ FUZZTIME    ?= 15s
 # improves; lowering it should take an argument.
 COVER_MIN   ?= 77
 
+# Pinned tool versions. `make lint` and the CI lint job read the same value, so
+# the two cannot drift; bump it here and nowhere else. govulncheck is pinned for
+# the same reason a linter is: a floating `@latest` can change what a run
+# reports without anything in the repository changing.
+GOLANGCI_LINT_VERSION ?= v2.13.2
+GOVULNCHECK_VERSION   ?= v1.8.0
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -62,8 +69,14 @@ vet: ## Run go vet
 	$(GO) vet ./...
 
 .PHONY: lint
-lint: ## Run golangci-lint (config: .golangci.yml)
-	golangci-lint run ./...
+lint: ## Run golangci-lint at GOLANGCI_LINT_VERSION (config: .golangci.yml)
+	$(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
+
+# For CI to read the pin, so that .github/workflows/ci.yml does not carry a
+# second copy of it. Deliberately not in `make help`.
+.PHONY: golangci-lint-version
+golangci-lint-version:
+	@echo $(GOLANGCI_LINT_VERSION)
 
 .PHONY: test
 test: ## Run unit tests with the race detector
@@ -112,10 +125,10 @@ fuzz: ## Run each fuzz target for FUZZTIME (default 15s)
 
 .PHONY: vulncheck
 vulncheck: ## Report known vulnerabilities reachable from this code
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: e2e
-e2e: ## End-to-end tests against a real registry:2 container (needs Docker)
+e2e: ## End-to-end tests against a real registry:3 container (needs Docker)
 	$(GO) test -race -timeout 20m ./test/...
 
 .PHONY: e2e-ghcr
