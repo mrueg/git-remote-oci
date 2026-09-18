@@ -397,10 +397,10 @@ func SeedRepository(t *testing.T, client *oci.Client, n int) (*git.Repository, s
 			t.Fatalf("CreatePackfileTo: %v", err)
 		}
 		if err := client.PushCommitStream(ctx, oci.CommitPush{
-			CommitSHA: tip,
-			RefName:   "refs/heads/main",
-			RefTag:    oci.EncodeRefTag("refs/heads/main"),
-			PackBases: prev,
+			CommitSHA:   tip,
+			RefName:     "refs/heads/main",
+			WriteRefTag: true,
+			PackBases:   prev,
 		}, bytes.NewReader(pack.Bytes()), int64(pack.Len())); err != nil {
 			t.Fatalf("push %d: %v", i, err)
 		}

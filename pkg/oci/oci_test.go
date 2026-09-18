@@ -29,10 +29,9 @@ func TestOCIClientPushAndFetch(t *testing.T) {
 	ctx := context.Background()
 	commitSHA := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 	refName := "refs/heads/main"
-	refTag := "main"
 	packfileData := []byte("mock-git-packfile-data")
 
-	err = pushCommitImage(ctx, client, commitSHA, refName, refTag, packfileData)
+	err = pushCommitImage(ctx, client, commitSHA, refName, true, packfileData)
 	if err != nil {
 		t.Fatalf("PushCommitImage failed: %v", err)
 	}
@@ -84,8 +83,8 @@ func TestPushCommitImageEmptyRefTag(t *testing.T) {
 	ctx := context.Background()
 	commitSHA := "1111111111111111111111111111111111111111"
 
-	// Push with empty refTag
-	err = pushCommitImage(ctx, client, commitSHA, "refs/heads/custom", "", []byte("pack"))
+	// Push without a ref tag
+	err = pushCommitImage(ctx, client, commitSHA, "refs/heads/custom", false, []byte("pack"))
 	if err != nil {
 		t.Fatalf("PushCommitImage failed: %v", err)
 	}
@@ -111,19 +110,19 @@ func TestPushCommitStreamSizeValidation(t *testing.T) {
 	commitSHA := "2222222222222222222222222222222222222222"
 
 	// 1. Short read (expected 10 bytes, provided 5)
-	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", RefTag: "main"}, bytes.NewReader([]byte("12345")), 10)
+	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", WriteRefTag: true}, bytes.NewReader([]byte("12345")), 10)
 	if err == nil || !strings.Contains(err.Error(), "packfile size mismatch") {
 		t.Errorf("Expected short read error, got: %v", err)
 	}
 
 	// 2. Excess bytes (expected 5 bytes, provided 10)
-	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", RefTag: "main"}, bytes.NewReader([]byte("1234567890")), 5)
+	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", WriteRefTag: true}, bytes.NewReader([]byte("1234567890")), 5)
 	if err == nil || !strings.Contains(err.Error(), "exceeds expected size") {
 		t.Errorf("Expected excess bytes error, got: %v", err)
 	}
 
 	// 3. Exact match (expected 5 bytes, provided 5)
-	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", RefTag: "main"}, bytes.NewReader([]byte("12345")), 5)
+	err = client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", WriteRefTag: true}, bytes.NewReader([]byte("12345")), 5)
 	if err != nil {
 		t.Errorf("Expected success on exact size match, got: %v", err)
 	}
@@ -142,7 +141,7 @@ func TestPushCommitImageInvalidSHA(t *testing.T) {
 	ctx := context.Background()
 
 	// Invalid SHA (too short)
-	err = pushCommitImage(ctx, client, "invalid-sha", "refs/heads/main", "main", []byte("pack"))
+	err = pushCommitImage(ctx, client, "invalid-sha", "refs/heads/main", true, []byte("pack"))
 	if err == nil || !strings.Contains(err.Error(), "invalid commit SHA") {
 		t.Errorf("Expected invalid commit SHA error, got: %v", err)
 	}
@@ -161,9 +160,9 @@ func TestPushCommitImageTagCollision(t *testing.T) {
 	ctx := context.Background()
 	commitSHA := "3333333333333333333333333333333333333333"
 
-	// Push with refTag equal to commitSHA
+	// Push a ref whose name encodes to the commit id itself
 	refName := "refs/heads/" + commitSHA
-	err = pushCommitImage(ctx, client, commitSHA, refName, commitSHA, []byte("pack-data"))
+	err = pushCommitImage(ctx, client, commitSHA, refName, true, []byte("pack-data"))
 	if err != nil {
 		t.Fatalf("PushCommitImage failed: %v", err)
 	}
@@ -186,12 +185,12 @@ func TestPushCommitImageTagCollision(t *testing.T) {
 		t.Errorf("Expected ref %s -> %s, got %s", refName, commitSHA, refs[refName])
 	}
 
-	// Push with refTag equal to a DIFFERENT 40-hex SHA string
+	// Push a ref whose name encodes to a DIFFERENT 40-hex SHA string
 	differentSHA := "4444444444444444444444444444444444444444"
 	diffRefName := "refs/heads/" + differentSHA
-	err = pushCommitImage(ctx, client, commitSHA, diffRefName, differentSHA, []byte("pack-data-2"))
+	err = pushCommitImage(ctx, client, commitSHA, diffRefName, true, []byte("pack-data-2"))
 	if err != nil {
-		t.Fatalf("PushCommitImage for different 40-hex refTag failed: %v", err)
+		t.Fatalf("PushCommitImage for a different 40-hex ref name failed: %v", err)
 	}
 
 	refs2, err := client.ListRefs(ctx)
@@ -307,7 +306,7 @@ func TestPushCommitStreamCompression(t *testing.T) {
 			t.Setenv("OCI_COMPRESSION", mode)
 			commitSHA := fmt.Sprintf("555555555555555555555555555555555555555%d", i)
 
-			err := client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", RefTag: "main"}, bytes.NewReader(rawPayload), int64(len(rawPayload)))
+			err := client.PushCommitStream(ctx, oci.CommitPush{CommitSHA: commitSHA, RefName: "refs/heads/main", WriteRefTag: true}, bytes.NewReader(rawPayload), int64(len(rawPayload)))
 			if err != nil {
 				t.Fatalf("PushCommitStream failed for mode %s: %v", mode, err)
 			}

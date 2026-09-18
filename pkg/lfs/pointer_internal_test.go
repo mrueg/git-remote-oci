@@ -1,9 +1,17 @@
 package lfs
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
+
+// formatPointer renders the canonical LFS pointer text. Production code only
+// ever parses pointers, so the serialiser lives with the test that round-trips
+// them.
+func (p *Pointer) formatPointer() string {
+	return fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", p.Oid, p.Size)
+}
 
 // FuzzParsePointer feeds arbitrary bytes to the LFS pointer parser.
 //

@@ -32,10 +32,10 @@ func TestDeleteRefOnRegistryThatRefusesManifestDeletion(t *testing.T) {
 		refName   = "refs/heads/doomed"
 		commitSHA = "3333333333333333333333333333333333333333"
 	)
-	if err := pushCommitImage(ctx, client, refName, refName, oci.EncodeRefTag(refName), []byte("PACK-doomed")); err == nil {
+	if err := pushCommitImage(ctx, client, refName, refName, true, []byte("PACK-doomed")); err == nil {
 		t.Fatal("expected an invalid commit SHA to be rejected")
 	}
-	if err := pushCommitImage(ctx, client, commitSHA, refName, oci.EncodeRefTag(refName), []byte("PACK-doomed")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, refName, true, []byte("PACK-doomed")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestDeleteRefStillFailsOnUnexpectedError(t *testing.T) {
 		refName   = "refs/heads/doomed"
 		commitSHA = "4444444444444444444444444444444444444444"
 	)
-	if err := pushCommitImage(ctx, client, commitSHA, refName, oci.EncodeRefTag(refName), []byte("PACK-doomed")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, refName, true, []byte("PACK-doomed")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 

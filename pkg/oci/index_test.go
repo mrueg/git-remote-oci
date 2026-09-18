@@ -39,7 +39,7 @@ func TestOCIImageIndexPushAndFetch(t *testing.T) {
 	// digest, and a ref with no manifest is skipped rather than emitted with an
 	// empty digest, which no client could follow.
 	for refName, entry := range refs {
-		if err := pushCommitImage(ctx, client, entry.SHA, refName, refName, []byte("PACK-fake-"+entry.SHA)); err != nil {
+		if err := pushCommitImage(ctx, client, entry.SHA, refName, true, []byte("PACK-fake-"+entry.SHA)); err != nil {
 			t.Fatalf("failed to seed manifest for %s: %v", refName, err)
 		}
 	}

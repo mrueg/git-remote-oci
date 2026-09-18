@@ -1922,7 +1922,7 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		err = h.ociClient.PushCommitStream(pCtx, oci.CommitPush{
 			CommitSHA:      commitSHA,
 			RefName:        dstRef,
-			RefTag:         refTag,
+			WriteRefTag:    true,
 			Parents:        parentsStr,
 			PackBases:      packBaseStrings(haveHashes),
 			TagAnnotations: tagAnnoMap,
@@ -2348,7 +2348,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		err := h.ociClient.PushCommitStream(ctx, oci.CommitPush{
 			CommitSHA:      parsed.commitSHA,
 			RefName:        parsed.dstRef,
-			RefTag:         parsed.refTag,
+			WriteRefTag:    true,
 			Parents:        parsed.parentsStr,
 			PackBases:      packBaseStrings(parsed.haveHashes),
 			TagAnnotations: parsed.tagAnnoMap,

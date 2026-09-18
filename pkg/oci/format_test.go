@@ -172,7 +172,7 @@ func TestRefManifestHasExactlyOneTag(t *testing.T) {
 		refName   = "refs/heads/feature/login"
 		commitSHA = "5555555555555555555555555555555555555555"
 	)
-	if err := pushCommitImage(ctx, client, commitSHA, refName, oci.EncodeRefTag(refName), []byte("PACK")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, refName, true, []byte("PACK")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 

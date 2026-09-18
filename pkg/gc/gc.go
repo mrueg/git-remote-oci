@@ -365,7 +365,7 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 	err := client.PushCommitStream(ctx, oci.CommitPush{
 		CommitSHA:      entry.SHA,
 		RefName:        refName,
-		RefTag:         refTag,
+		WriteRefTag:    true,
 		TagAnnotations: tagAnnotations,
 		ExtraLayers:    extraLayers,
 		// This commit is almost certainly already published; replacing its

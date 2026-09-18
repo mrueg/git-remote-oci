@@ -314,11 +314,12 @@ type CommitPush struct {
 	// CommitSHA is the commit the manifest is published for.
 	CommitSHA string
 	// RefName is the full git ref name, e.g. "refs/heads/main". Required
-	// whenever RefTag is set.
+	// whenever WriteRefTag is set.
 	RefName string
-	// RefTag is the tag the ref manifest is published under. Empty publishes
-	// only the ref-agnostic commit manifest.
-	RefTag string
+	// WriteRefTag also publishes a ref manifest under the tag derived from
+	// RefName (see RefManifestTag). False publishes only the ref-agnostic
+	// commit manifest.
+	WriteRefTag bool
 	// Parents is the comma-separated list of the commit's git parents. It is
 	// metadata; see PackBases for what fetch actually follows.
 	Parents string
@@ -357,8 +358,9 @@ func (p *CommitPush) validate() error {
 	return nil
 }
 
-// PushCommitStream pushes a packfile layer stream, config blob, and manifest tagged with p.CommitSHA and p.RefTag.
-// If p.RefTag sanitises to a 40-character hex string (e.g. branch named after a SHA or matching p.CommitSHA), the ref manifest
+// PushCommitStream pushes a packfile layer stream, config blob, and manifest tagged with p.CommitSHA and,
+// when p.WriteRefTag is set, a ref manifest under RefManifestTag(p.RefName).
+// If that tag sanitises to a 40-character hex string (e.g. branch named after a SHA or matching p.CommitSHA), the ref manifest
 // is tagged with "ref-<sanitisedTag>" so ListRefs can discover it and commitSHA tags remain ref-agnostic.
 // If packfileSize > 0, the stream is validated to contain exactly packfileSize bytes.
 // If packfileSize <= 0, the stream is read until EOF.
@@ -446,9 +448,8 @@ func (c *Client) pushCommitArtifacts(
 	// the ref manifest have already been pushed in this process (e.g. a
 	// multi-branch push touching the same commit).
 	//
-	// IsRefFullyPushed takes the ref *name*: it derives the tag itself, so
-	// handing it p.RefTag would ask about a doubly-encoded tag that is never in
-	// the cache.
+	// IsRefFullyPushed takes the ref *name*: it derives the tag itself, the
+	// same way the ref manifest below is tagged.
 	if !p.Rewrite && c.IsRefFullyPushed(commitSHA, refName) {
 		return nil
 	}
@@ -550,15 +551,14 @@ func (c *Client) pushCommitArtifacts(
 		c.manifestCache.Store(commitManifestDesc.Digest.String(), &commitManifest)
 	}
 
-	// 3b. If refTag is provided, push a separate manifest for the ref tag containing AnnotationGitRef.
+	// 3b. If a ref tag is wanted, push a separate manifest for it containing AnnotationGitRef.
 	// To keep the commitSHA tag immutable and prevent collision/overwriting when sanitisedTag == commitSHA,
 	// publish the ref-annotated manifest under a "ref-" prefixed tag if a collision occurs.
-	if p.RefTag != "" {
+	if p.WriteRefTag {
 		if refName == "" {
-			return fmt.Errorf("refName cannot be empty when refTag %q is provided", p.RefTag)
+			return errors.New("refName cannot be empty when a ref tag is requested")
 		}
-		// Encode from the ref name, not from refTag: refTag is only a display
-		// hint, while refName is what has to map injectively onto a tag.
+		// The ref name is what has to map injectively onto a tag.
 		targetTag := RefManifestTag(refName)
 		if targetTag == "" {
 			return fmt.Errorf("ref %q cannot be represented as an OCI tag", refName)
