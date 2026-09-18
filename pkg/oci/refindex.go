@@ -623,6 +623,21 @@ func (c *Client) SetHead(ctx context.Context, ref string) (previous string, err 
 		if commitErr != nil {
 			return "", commitErr
 		}
+		if errors.Is(conflict, ErrLockTakenOver) {
+			// Written under a lock another client also held: the recorded
+			// HEAD is the only evidence of whether this write survived
+			// theirs. See PushRichRefIndexWithHead.
+			recorded, readErr := c.currentHead(ctx)
+			if readErr != nil {
+				return "", fmt.Errorf("failed to read the recorded HEAD back: %w", readErr)
+			}
+			if recorded != ref {
+				lastConflict = fmt.Errorf("%w; the recorded HEAD is %q, not %s", conflict, recorded, ref)
+				continue
+			}
+			c.verbosef("the _refs index lock was taken over while setting HEAD, but the published index records it")
+			return previous, nil
+		}
 		if conflict != nil {
 			lastConflict = conflict
 			continue
@@ -706,6 +721,23 @@ func (c *Client) PushRichRefIndexWithHead(ctx context.Context, refs map[string]R
 		if err != nil {
 			return err
 		}
+		if errors.Is(conflict, ErrLockTakenOver) {
+			// The write landed, but the lock was shared with another client
+			// for the whole of it, so theirs may have landed on top. The
+			// published index is the only thing that can say. If every entry
+			// this push wrote is there, the write is durable and the lock
+			// never mattered; if not, this goes round again and re-merges on
+			// top of whatever they left, as it would for any other conflict.
+			// Reporting the ref as not visible here, as this used to, was
+			// wrong in both directions: the index usually did hold it, and
+			// when it did not, nothing was done about it.
+			if verifyErr := c.verifyPublishedRefs(ctx, refs, deleted); verifyErr != nil {
+				lastConflict = fmt.Errorf("%w; %w", conflict, verifyErr)
+				continue
+			}
+			c.verbosef("the _refs index lock was taken over during this update, but the published index carries every ref it wrote")
+			return nil
+		}
 		if conflict != nil {
 			lastConflict = conflict
 			continue
@@ -715,22 +747,71 @@ func (c *Client) PushRichRefIndexWithHead(ctx context.Context, refs map[string]R
 	return fmt.Errorf("gave up updating the _refs index after %d attempts: %w", refsIndexMaxAttempts, lastConflict)
 }
 
+// verifyPublishedRefs reads the published index back and checks that it
+// carries every ref in refs at the SHA given and none of deleted. It is the
+// arbiter after a write whose lock turned out to be shared: what the registry
+// serves is the only evidence of what the push achieved.
+//
+// Only the SHA is compared. The rest of an entry is metadata about the same
+// commit, and a concurrent writer that republished it may legitimately have
+// sanitised or trimmed it.
+func (c *Client) verifyPublishedRefs(ctx context.Context, refs map[string]RefEntry, deleted map[string]bool) error {
+	published, err := c.FetchRichRefIndex(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read the published _refs index back: %w", err)
+	}
+	for refName, want := range refs {
+		got, ok := published[refName]
+		if !ok {
+			return fmt.Errorf("%s is missing from the published _refs index", refName)
+		}
+		if got.SHA != want.SHA {
+			return fmt.Errorf("%s is %s in the published _refs index, not %s", refName, shortDigest(got.SHA), shortDigest(want.SHA))
+		}
+	}
+	for refName := range deleted {
+		if _, still := published[refName]; still {
+			return fmt.Errorf("%s is still in the published _refs index after its deletion", refName)
+		}
+	}
+	return nil
+}
+
 // commitRefIndex takes the index lock, verifies nothing moved since baseline,
 // and writes.
 //
 // A non-nil first return is a lost race, not a failure: the caller re-merges
-// against the newer state and tries again.
+// against the newer state and tries again. One shape of it needs more than a
+// retry: a conflict wrapping ErrLockTakenOver means the write *went through*,
+// but the lock turned out to be shared with another client the whole time, so
+// the write may since have been overwritten by theirs. The caller must read
+// the published index back and either confirm its entries or redo the update;
+// it must not report success on the strength of the lock.
 func (c *Client) commitRefIndex(ctx context.Context, baseline string, remoteRefs map[string]RefEntry, head string) (conflict error, err error) {
 	if lockErr := c.acquireRefsIndexLock(ctx); lockErr != nil {
 		return nil, lockErr
 	}
 	defer func() {
+		releaseErr := c.releaseRefsIndexLock(ctx)
+		if releaseErr == nil {
+			return
+		}
+		if errors.Is(releaseErr, ErrLockTakenOver) && err == nil {
+			// Not a lock left stranded: the registry holds someone else's, and
+			// FORMAT.md §9 forbids touching it. What it means is that the
+			// lock never serialised anything, so the outcome of this attempt
+			// is unknown until the caller re-reads. A digest conflict already
+			// sends the caller round again; only a write that appeared to
+			// succeed needs to be marked.
+			if conflict == nil {
+				conflict = releaseErr
+			}
+			return
+		}
 		// A lock that could not be given back stalls every other writer until
 		// the TTL runs out, which is worth more than a warning: the caller is
 		// told even when the write itself went through.
-		if releaseErr := c.releaseRefsIndexLock(ctx); releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-		}
+		err = errors.Join(err, releaseErr)
 	}()
 
 	// Re-check under the lock. Anything that changed since baseline means the

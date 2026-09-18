@@ -210,6 +210,15 @@ func (c *Client) warnf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "git-remote-oci: warning: "+format+"\n", args...)
 }
 
+// verbosef reports something that went right in an unusual way. Unlike warnf
+// it is silent without a hook: it is detail nobody asked for unless they
+// turned verbosity up.
+func (c *Client) verbosef(format string, args ...any) {
+	if c.Verbosef != nil {
+		c.Verbosef(format, args...)
+	}
+}
+
 // concurrency is Concurrency with the zero value and nonsense mapped to the
 // default, so a Client built without NewClient still fans out sensibly.
 func (c *Client) concurrency() int {
@@ -227,6 +236,10 @@ type Client struct {
 	// `option verbosity`; nil writes them to stderr prefixed
 	// "git-remote-oci: warning: ".
 	Warnf func(format string, args ...any)
+
+	// Verbosef receives diagnostics worth seeing only when asked for, in the
+	// same shape as Warnf. nil discards them.
+	Verbosef func(format string, args ...any)
 
 	// Concurrency bounds how many registry requests the client makes in
 	// parallel where it fans out on its own, such as resolving every ref

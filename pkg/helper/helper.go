@@ -189,6 +189,9 @@ func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper,
 	client.Warnf = func(format string, args ...any) {
 		h.logWarn("git-remote-oci: warning: "+format+"\n", args...)
 	}
+	client.Verbosef = func(format string, args ...any) {
+		h.logVerbose("git-remote-oci: [verbose] "+format+"\n", args...)
+	}
 	return h, nil
 }
 

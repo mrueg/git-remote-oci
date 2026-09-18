@@ -36,6 +36,15 @@ const (
 // and must not be presented as contention.
 var ErrRefLocked = errors.New("reference is locked")
 
+// ErrLockTakenOver reports that a release found the published lock belonging
+// to someone else. Acquisition is check-then-write (FORMAT.md §9), so two
+// clients can come out of it both believing they hold a ref; the one whose
+// manifest was overwritten learns it here. Nothing of theirs is left to
+// release, but whatever they wrote under the lock may have raced the other
+// holder's write, so a caller that wrote something must re-read it before
+// claiming success.
+var ErrLockTakenOver = errors.New("lock was taken over")
+
 // LockInfo represents distributed reference lock metadata.
 type LockInfo struct {
 	Ref       string    `json:"ref"`
@@ -394,7 +403,7 @@ func (c *Client) verifyLockOwnership(ctx context.Context, refName string) (live 
 		// took it. Forgetting our stale id is what lets this client acquire
 		// the ref again later: AcquireRefLock refuses while an entry exists.
 		c.heldLocks.Delete(refName)
-		return false, fmt.Errorf("refusing to release lock on %s: it was taken over by %s", refName, info.Owner)
+		return false, fmt.Errorf("refusing to release lock on %s: it was taken over by %s: %w", refName, info.Owner, ErrLockTakenOver)
 	}
 	return true, nil
 }
