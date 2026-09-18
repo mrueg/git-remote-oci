@@ -23,42 +23,42 @@ type testRepo struct {
 	wt   *gogit.Worktree
 }
 
-func newTestRepo(t *testing.T) *testRepo {
-	t.Helper()
+func newTestRepo(tb testing.TB) *testRepo {
+	tb.Helper()
 
-	dir := t.TempDir()
+	dir := tb.TempDir()
 	g, err := gogit.PlainInit(dir, false)
 	if err != nil {
-		t.Fatalf("PlainInit: %v", err)
+		tb.Fatalf("PlainInit: %v", err)
 	}
 	wt, err := g.Worktree()
 	if err != nil {
-		t.Fatalf("Worktree: %v", err)
+		tb.Fatalf("Worktree: %v", err)
 	}
-	t.Setenv("GIT_DIR", filepath.Join(dir, ".git"))
+	tb.Setenv("GIT_DIR", filepath.Join(dir, ".git"))
 
 	repo, err := git.OpenRepository()
 	if err != nil {
-		t.Fatalf("OpenRepository: %v", err)
+		tb.Fatalf("OpenRepository: %v", err)
 	}
 	return &testRepo{dir: dir, repo: repo, git: g, wt: wt}
 }
 
 // commit writes a file and commits it, returning the new commit hash.
-func (r *testRepo) commit(t *testing.T, name, content, message string) plumbing.Hash {
-	t.Helper()
+func (r *testRepo) commit(tb testing.TB, name, content, message string) plumbing.Hash {
+	tb.Helper()
 
 	if err := os.WriteFile(filepath.Join(r.dir, name), []byte(content), 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+		tb.Fatalf("WriteFile: %v", err)
 	}
 	if _, err := r.wt.Add(name); err != nil {
-		t.Fatalf("Add: %v", err)
+		tb.Fatalf("Add: %v", err)
 	}
 	h, err := r.wt.Commit(message, &gogit.CommitOptions{
 		Author: &object.Signature{Name: "T", Email: "t@example.com", When: time.Now()},
 	})
 	if err != nil {
-		t.Fatalf("Commit: %v", err)
+		tb.Fatalf("Commit: %v", err)
 	}
 	return h
 }
