@@ -177,3 +177,59 @@ func TestFsckPassesWhenTheMirrorAgrees(t *testing.T) {
 		t.Errorf("fsck did not report the mirror as matching:\n%s", stdout)
 	}
 }
+
+// TestFsckDetectsARefManifestWithoutAPackfile: a manifest whose annotations
+// are all in order but which carries nothing to fetch is exactly as unclonable
+// as one naming a missing base, and the annotation walk alone said it was
+// fine.
+func TestFsckDetectsARefManifestWithoutAPackfile(t *testing.T) {
+	reg, url, _ := seeded(t)
+
+	for _, mediaType := range []string{oci.MediaTypeGitPackfile, oci.MediaTypeGitPackfileGzip, oci.MediaTypeGitPackfileZstd} {
+		if err := reg.StripLayers(mediaType); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stdout, stderr, err := runCLI(t, "fsck", url)
+	if err == nil {
+		t.Fatalf("fsck reported a repository with no packfiles as healthy\nstdout: %s", stdout)
+	}
+	if !strings.Contains(stderr, "no packfile layer") {
+		t.Errorf("fsck did not say the packfile was missing:\nstderr: %s", stderr)
+	}
+}
+
+// TestFsckDetectsAPackChainNamingAMissingManifest: the chain on `_refs` is
+// what a reader fetches by, so an entry naming a manifest the registry no
+// longer serves breaks a clone even when every annotation is correct. That is
+// what a compaction that pruned before republishing the chain left behind.
+func TestFsckDetectsAPackChainNamingAMissingManifest(t *testing.T) {
+	reg, url, tip := seeded(t)
+
+	// The commit tags in push order: c1, c2, c3 == tip.
+	var commits []string
+	for _, tag := range reg.Tags() {
+		if oci.IsCommitID(tag) {
+			commits = append(commits, tag)
+		}
+	}
+	if len(commits) != 3 || commits[2] != tip {
+		t.Fatalf("fixture error: expected three commit tags ending in the tip, got %v", commits)
+	}
+
+	// Make the tip self-contained as far as its annotations go, so the
+	// annotation walk has nothing to follow, and then remove the manifest the
+	// chain still says the tip was packed against.
+	reg.SetPackBases(t, tip, oci.PackBasesNone)
+	reg.SetPackBases(t, mainTag, oci.PackBasesNone)
+	reg.DropManifest(commits[1])
+
+	stdout, stderr, err := runCLI(t, "fsck", url)
+	if err == nil {
+		t.Fatalf("fsck reported a repository whose pack chain names a missing manifest as healthy\nstdout: %s", stdout)
+	}
+	if !strings.Contains(stderr, "pack chain") {
+		t.Errorf("fsck did not blame the pack chain:\nstderr: %s", stderr)
+	}
+}

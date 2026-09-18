@@ -16,6 +16,8 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -163,7 +165,7 @@ func ReservedNames() []string {
 // Run dispatches a single invocation.
 func Run(ctx context.Context, env Env) error {
 	if len(env.Args) == 0 {
-		usage(env.Stderr)
+		diag(env.Stderr, "%s", usageText())
 		return fmt.Errorf("no arguments given")
 	}
 
@@ -174,7 +176,15 @@ func Run(ctx context.Context, env Env) error {
 		if err := checkRemoteNameCollision(env, name); err != nil {
 			return err
 		}
-		return sub.run(ctx, env)
+		err := sub.run(ctx, env)
+		if errors.Is(err, flag.ErrHelp) {
+			// `<subcommand> -h` asked for the usage and got it; the flag
+			// package reports that as an error so that parsing stops. It is
+			// not a failure, and exiting non-zero with "flag: help requested"
+			// after the usage text read as one.
+			return nil
+		}
+		return err
 	}
 
 	// Git's remote-helper invocation: exactly <remote> <url>.
@@ -186,7 +196,7 @@ func Run(ctx context.Context, env Env) error {
 		return h.Run(ctx)
 	}
 
-	usage(env.Stderr)
+	diag(env.Stderr, "%s", usageText())
 	return fmt.Errorf("unrecognised arguments: %s", strings.Join(env.Args, " "))
 }
 
@@ -231,16 +241,33 @@ func runVersion(_ context.Context, env Env) error {
 	if err := noArgs(env, "version"); err != nil {
 		return err
 	}
-	fmt.Fprintf(env.Stdout, "git-remote-oci %s\n", env.Version)
-	return nil
+	return printf(env.Stdout, "git-remote-oci %s\n", env.Version)
 }
 
 func runHelp(_ context.Context, env Env) error {
 	if err := noArgs(env, "help"); err != nil {
 		return err
 	}
-	usage(env.Stdout)
-	return nil
+	return printf(env.Stdout, "%s", usageText())
+}
+
+// printf writes a subcommand's result to its stdout.
+//
+// The write error is the subcommand's error: a result that did not reach the
+// caller is a failed command, however well the registry operation went, and a
+// non-zero exit is the only way to say so.
+func printf(w io.Writer, format string, a ...any) error {
+	_, err := fmt.Fprintf(w, format, a...)
+	return err
+}
+
+// diag writes a diagnostic to a subcommand's stderr.
+//
+// The write error is dropped on purpose. A diagnostic accompanies an error
+// that is about to be returned, or a usage request, and a stderr that cannot
+// be written to leaves nothing better to do than carry on to that return.
+func diag(w io.Writer, format string, a ...any) {
+	_, _ = fmt.Fprintf(w, format, a...)
 }
 
 // clientFor builds a registry client for an oci:// URL. The scheme and
@@ -257,8 +284,12 @@ func clientFor(env Env, rawURL string) (*oci.Client, error) {
 	return client, nil
 }
 
-func usage(w io.Writer) {
-	fmt.Fprint(w, `git-remote-oci - store git repositories in OCI registries
+// usageText renders the top-level help. It is a value rather than a writer so
+// that the one caller for whom it is the result (help) and the ones for whom
+// it is a diagnostic can each treat the write accordingly.
+func usageText() string {
+	var b strings.Builder
+	b.WriteString(`git-remote-oci - store git repositories in OCI registries
 
 Git invokes this automatically for oci:// remotes; you do not normally run it
 by hand:
@@ -280,10 +311,10 @@ Subcommands:
 		if s.args != "" {
 			invocation += " " + s.args
 		}
-		fmt.Fprintf(w, "    %-*s  %s\n", width, invocation, s.summary)
+		fmt.Fprintf(&b, "    %-*s  %s\n", width, invocation, s.summary)
 	}
 
-	fmt.Fprintf(w, `
+	fmt.Fprintf(&b, `
 Because git invokes the helper as "git-remote-oci <remote> <url>", a git remote
 cannot be named any of:
 
@@ -291,4 +322,5 @@ cannot be named any of:
 
 Run "git-remote-oci <subcommand> -h" for a subcommand's flags.
 `, strings.Join(ReservedNames(), ", "))
+	return b.String()
 }
