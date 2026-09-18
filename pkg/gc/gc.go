@@ -85,19 +85,15 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	// All of them are checked up front, so the run either proceeds fully or
 	// stops before it has half-rewritten the repository.
 	source := repo
-	if missing := missingLocally(repo, refs); len(missing) > 0 {
+	if missing, why := missingLocally(repo, refs); len(missing) > 0 {
 		sort.Strings(missing)
 		if opts.DryRun {
-			opts.Logf("would fetch %d ref(s) from the registry to repack: %v\n", len(missing), missing)
+			opts.Logf("would fetch %d ref(s) from the registry to repack: %v (%s)\n", len(missing), missing, why)
 		} else {
-			opts.Logf("%d ref(s) are not in the local repository (%v); fetching them to repack\n",
-				len(missing), missing)
+			opts.Logf("%d ref(s) are not in the local repository (%v; %s); fetching them to repack\n",
+				len(missing), missing, why)
 
-			entries := make([]oci.RefEntry, 0, len(refs))
-			for _, entry := range refs {
-				entries = append(entries, entry)
-			}
-			staged, hydrateErr := hydrate(ctx, client, entries, opts.Logf)
+			staged, hydrateErr := hydrate(ctx, client, refs, opts.Logf)
 			if hydrateErr != nil {
 				return nil, fmt.Errorf("failed to fetch the history to repack: %w", hydrateErr)
 			}
@@ -185,9 +181,9 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 		result.RefsConsolidated++
 	}
 
-	// The ref set as it stands now, which is what gets republished and what
-	// decides whether pruning is safe. Using the opening snapshot here is how a
-	// concurrent push gets reverted.
+	// The ref set as it stands now, which is what decides whether pruning is
+	// safe. Comparing against the opening snapshot is how a push that landed
+	// mid-run is noticed at all.
 	latest := refs
 	if !opts.DryRun {
 		if fresh, err := client.FetchRichRefIndex(ctx); err == nil {
@@ -202,7 +198,30 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 		concurrent = append(concurrent, changed...)
 	}
 
-	// 2. Pruning, and only if nothing moved underneath the consolidation.
+	// 2. Republish the indexes so they describe the consolidated repository.
+	//
+	// Before anything is deleted, not after. `_refs` carries the pack chain
+	// (§6.1), and the chain still published at this point names every
+	// intermediate manifest the pruning below removes. A run that died between
+	// deleting them and rewriting the chain -- a crash, a failed write -- left
+	// a chain pointing at manifests that no longer existed, and a reader
+	// following it hit a missing base, which the format makes fatal. Written
+	// now, the chain says each consolidated ref stands alone, which is true
+	// from here on whatever happens next; the worst a failure after this
+	// leaves behind is a commit tag nobody needs.
+	//
+	// No refs of its own. gc moves no ref, so it has nothing to say about
+	// where any of them point; the merge inside this call takes the live
+	// index as it stands. Handing it a snapshot instead -- even one re-read a
+	// moment ago -- was how a push landing between that read and this write
+	// got rewound: the caller's entries win the merge unconditionally.
+	if !opts.DryRun {
+		if err := client.PushRichRefIndex(ctx, nil, nil); err != nil {
+			return nil, fmt.Errorf("failed to republish the ref index: %w", err)
+		}
+	}
+
+	// 3. Pruning, and only if nothing moved underneath the consolidation.
 	//
 	// A commit tag is a pack base. Deleting one that a push published while
 	// this ran strands the ref that names it, and the check above cannot be
@@ -211,14 +230,13 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	// otherwise to leave it for the next one. Deferring costs a repository that
 	// stays large for another push; getting it wrong costs a ref that cannot be
 	// fetched.
+	prune := before
 	if len(concurrent) > 0 {
 		sort.Strings(concurrent)
 		opts.Logf("not pruning this run: %v changed while it was working\n", concurrent)
+		prune = nil
 	}
-	for _, tag := range before {
-		if len(concurrent) > 0 {
-			break
-		}
+	for _, tag := range prune {
 		switch oci.ClassifyTag(tag) {
 		case oci.TagClassCommit:
 			if keep[tag] {
@@ -280,16 +298,6 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 		return result, nil
 	}
 
-	// 3. Republish the indexes so they describe the compacted repository.
-	//
-	// From `latest`, never the opening snapshot. The merge inside this call
-	// gives the caller's entries precedence unconditionally, so passing a stale
-	// view here is not a missed optimisation -- it is how a ref another client
-	// advanced mid-run gets written back to where it used to be.
-	if err := client.PushRichRefIndex(ctx, latest, nil); err != nil {
-		return nil, fmt.Errorf("failed to republish the ref index: %w", err)
-	}
-
 	after, err := client.ListAllTags(ctx)
 	if err != nil {
 		return nil, err
@@ -308,15 +316,8 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 		wantHash = plumbing.NewHash(entry.TagObject)
 	}
 
-	pr, pw := io.Pipe()
-	go func() {
-		// No haveHashes: the point is a self-contained pack.
-		_ = pw.CloseWithError(repo.CreatePackfileTo(pw, wantHash, nil))
-	}()
-
 	refTag := oci.RefManifestTag(refName)
 	if refTag == "" {
-		_ = pr.CloseWithError(nil)
 		return fmt.Errorf("ref %q cannot be represented as an OCI tag", refName)
 	}
 
@@ -326,6 +327,9 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 	// the index here would leave every compacted repository paying the cost
 	// compaction was run to avoid. Failing to build one is not a failed
 	// consolidation; a missing index reads as "unknown" and falls back.
+	//
+	// Listed before the packfile goroutine starts: both walk the same go-git
+	// storer, and that is not safe to do from two goroutines at once.
 	var extraLayers []ocispec.Descriptor
 	if objects, idxErr := repo.PackedObjects(wantHash, nil); idxErr == nil {
 		if desc, pushErr := client.PushPackIndex(ctx, packIndexEntries(objects)); pushErr == nil && desc.Digest != "" {
@@ -333,15 +337,37 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 		}
 	}
 
+	// An annotated tag's metadata travels on the ref manifest (FORMAT.md §5),
+	// and a consolidation replaces that manifest. The index entry is where the
+	// same facts were recorded at push time, so they are carried across from
+	// there; a rewrite that dropped them would turn every annotated tag in
+	// the repository into a lightweight one on the next clone.
+	var tagAnnotations map[string]string
+	if entry.TagObject != "" {
+		tagAnnotations = map[string]string{
+			oci.AnnotationGitTagObj:     entry.TagObject,
+			oci.AnnotationGitTagger:     entry.Tagger,
+			oci.AnnotationGitTagMessage: entry.TagMessage,
+			oci.AnnotationGitTagSig:     entry.TagSig,
+		}
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		// No haveHashes: the point is a self-contained pack.
+		_ = pw.CloseWithError(repo.CreatePackfileTo(pw, wantHash, nil))
+	}()
+
 	// No parents and no pack bases: a consolidated packfile carries the whole
 	// history, so it depends on nothing. Declaring PackBasesNone is what makes
 	// the pruning below safe - a fetcher of this ref will never be sent looking
 	// for a commit manifest this run is about to delete.
 	err := client.PushCommitStream(ctx, oci.CommitPush{
-		CommitSHA:   entry.SHA,
-		RefName:     refName,
-		RefTag:      refTag,
-		ExtraLayers: extraLayers,
+		CommitSHA:      entry.SHA,
+		RefName:        refName,
+		RefTag:         refTag,
+		TagAnnotations: tagAnnotations,
+		ExtraLayers:    extraLayers,
 		// This commit is almost certainly already published; replacing its
 		// packfile with a self-contained one is the point of the run.
 		Rewrite: true,

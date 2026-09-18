@@ -188,7 +188,7 @@ func TestRunOnEmptyRepositoryIsANoOp(t *testing.T) {
 	client := registrytest.Client(t, reg.Serve(t))
 
 	dir := t.TempDir()
-	cmd := exec.Command("git", "init", "-q", "-b", "main", ".")
+	cmd := exec.CommandContext(t.Context(), "git", "init", "-q", "-b", "main", ".")
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v\n%s", err, out)
