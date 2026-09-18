@@ -45,6 +45,29 @@ func (h *Helper) maybeCompact(ctx context.Context) {
 		return
 	}
 
+	// A clone that does not hold the whole history cannot be the source of a
+	// consolidated packfile. gc would notice and fetch everything from the
+	// registry instead, which is correct and is also a download of the entire
+	// repository tacked onto somebody's push -- the opposite of the "already
+	// holds the objects, costs no download" reasoning that put this on the
+	// pusher in the first place. Left to a full clone, or to `gc` run by hand.
+	if h.gitRepo != nil {
+		var why string
+		switch {
+		case h.gitRepo.IsShallow():
+			why = "a shallow clone"
+		case h.gitRepo.IsPartial():
+			why = "a partial clone"
+		}
+		if why != "" {
+			h.logInfo("git-remote-oci: %d published commits is over the %d this remote compacts at, "+
+				"but this is %s and does not hold the whole history; not compacting from here\n",
+				len(chain), h.compactAfter, why)
+			h.logInfo("git-remote-oci: (run `git-remote-oci gc` to compact from the registry's own copy)\n")
+			return
+		}
+	}
+
 	h.logInfo("git-remote-oci: %d published commits is over the %d this remote compacts at; repacking\n",
 		len(chain), h.compactAfter)
 	h.logInfo("git-remote-oci: (set ociremote.compactAfter to change or disable this)\n")

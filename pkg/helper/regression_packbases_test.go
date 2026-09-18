@@ -16,7 +16,7 @@ import (
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(gitEnvWithoutGitDir(),
 		"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com",
@@ -91,7 +91,7 @@ func newBareRepo(t *testing.T) string {
 func assertComplete(t *testing.T, gitDir, sha string) {
 	t.Helper()
 
-	cmd := exec.Command("git", "--git-dir="+gitDir, "rev-list", "--objects", "--no-object-names", "--missing=print", sha)
+	cmd := exec.CommandContext(t.Context(), "git", "--git-dir="+gitDir, "rev-list", "--objects", "--no-object-names", "--missing=print", sha)
 	cmd.Env = gitEnvWithoutGitDir()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -189,7 +189,7 @@ func TestMultiCommitPushCloneHasFullHistory(t *testing.T) {
 func gitOutput(t *testing.T, gitDir string, args ...string) string {
 	t.Helper()
 
-	cmd := exec.Command("git", append([]string{"--git-dir=" + gitDir}, args...)...)
+	cmd := exec.CommandContext(t.Context(), "git", append([]string{"--git-dir=" + gitDir}, args...)...)
 	cmd.Env = gitEnvWithoutGitDir()
 	out, err := cmd.CombinedOutput()
 	if err != nil {

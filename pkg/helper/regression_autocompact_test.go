@@ -19,7 +19,7 @@ import (
 // was minding. These pin the version that happens by itself.
 
 // pushN makes n separate pushes to url, one commit each.
-func pushN(t *testing.T, url string, n int, extraConfig ...string) string {
+func pushN(t *testing.T, url string, n int, extraConfig ...string) {
 	t.Helper()
 	src := t.TempDir()
 	git(t, src, "init", "-q", "-b", "main", src)
@@ -36,7 +36,6 @@ func pushN(t *testing.T, url string, n int, extraConfig ...string) string {
 		args = append(args, "push", "-q", url, "main")
 		git(t, src, args...)
 	}
-	return src
 }
 
 // TestAutoCompactTriggersAtTheThreshold.

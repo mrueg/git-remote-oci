@@ -206,11 +206,7 @@ func (m *mockRegistry) Server() *httptest.Server {
 
 func TestHelperEndToEnd(t *testing.T) {
 	// 1. Create temporary directory for source repo
-	srcDir, err := os.MkdirTemp("", "git-oci-src-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	// Initialise git repo using go-git
 	repo, err := gogit.PlainInit(srcDir, false)
@@ -301,11 +297,7 @@ func TestHelperEndToEnd(t *testing.T) {
 	}
 
 	// 5. Test fetch into a new clean repo
-	dstDir, err := os.MkdirTemp("", "git-oci-dst-*")
-	if err != nil {
-		t.Fatalf("Failed to create dst temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(dstDir) }()
+	dstDir := t.TempDir()
 
 	dstRepo, err := gogit.PlainInit(dstDir, false)
 	if err != nil {
@@ -641,11 +633,7 @@ func TestHelperEndToEnd(t *testing.T) {
 		t.Errorf("Dry-run push should NOT create remote ref refs/heads/dryrun-branch, but found it in list:\n%s", outBufListCheck.String())
 	}
 	// 13. Test option depth <n> for shallow fetch (depth 1)
-	shallowDir, err := os.MkdirTemp("", "git-oci-shallow-*")
-	if err != nil {
-		t.Fatalf("Failed to create shallow temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(shallowDir) }()
+	shallowDir := t.TempDir()
 
 	_, err = gogit.PlainInit(shallowDir, false)
 	if err != nil {
@@ -668,7 +656,7 @@ func TestHelperEndToEnd(t *testing.T) {
 	}
 
 	// Verify shallow repository only imported 1 commit
-	revCountCmd := exec.Command("git", "--git-dir="+filepath.Join(shallowDir, ".git"), "rev-list", "--count", headHash.String())
+	revCountCmd := exec.CommandContext(t.Context(), "git", "--git-dir="+filepath.Join(shallowDir, ".git"), "rev-list", "--count", headHash.String())
 	revCountOut, err := revCountCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to count commits in shallow repo: %v\nOutput: %s", err, string(revCountOut))
@@ -985,8 +973,11 @@ func TestCapabilitiesAdvertisesOnlyRealNames(t *testing.T) {
 	}
 }
 
-func TestOptionFilterAndDeepen(t *testing.T) {
-	cmdInput := "capabilities\noption filter blob:none\noption filter blob:limit=100\noption deepen 2\nquit\n"
+func TestOptionFilterAndDepth(t *testing.T) {
+	// "deepen" is not an option gitremote-helpers(7) defines -- the shallow
+	// options are `depth` and the `deepen-*` family -- so accepting it
+	// claimed support for something git never sends.
+	cmdInput := "capabilities\noption filter blob:none\noption filter blob:limit=100\noption depth 2\noption deepen 2\nquit\n"
 	inBuf := bytes.NewBufferString(cmdInput)
 	outBuf := new(bytes.Buffer)
 
@@ -1000,11 +991,11 @@ func TestOptionFilterAndDeepen(t *testing.T) {
 		t.Fatalf("Helper.Run failed: %v", err)
 	}
 
-	// "filter" and "deepen" are option names, not capabilities, so they are no
-	// longer advertised. Both options are still accepted.
+	// "filter" and "depth" are option names, not capabilities, so they are not
+	// advertised. Both options are accepted; the made-up one is not.
 	out := outBuf.String()
-	if !strings.Contains(out, "ok\nok\nok") {
-		t.Errorf("Unexpected filter/deepen option response, got:\n%s", out)
+	if !strings.Contains(out, "ok\nok\nok\nunsupported\n") {
+		t.Errorf("Unexpected filter/depth option response, got:\n%s", out)
 	}
 }
 

@@ -50,10 +50,10 @@ func (h *Helper) v2ObjectInfo(ctx context.Context, w *pktWriter, req v2Request) 
 	// it was never offered. Answering with sizes it did not request would be a
 	// response it cannot parse.
 	if !wantSize {
-		if err := sendV2Error(w, "protocol v2: object-info supports only the size attribute"); err != nil {
-			return err
-		}
-		return endResponse(w)
+		// sendV2Error terminates the response itself; ending it again put a
+		// second flush and response-end on the wire, which git reads as the
+		// start of a response to a request it has not made.
+		return sendV2Error(w, "protocol v2: object-info supports only the size attribute")
 	}
 	if len(oids) == 0 {
 		if err := w.WriteLine("size"); err != nil {
@@ -67,10 +67,7 @@ func (h *Helper) v2ObjectInfo(ctx context.Context, w *pktWriter, req v2Request) 
 		// An ERR packet rather than a dropped connection: git reports the
 		// former as the remote's own message and the latter as "the remote end
 		// hung up unexpectedly", which names neither the cause nor the side.
-		if sendErr := sendV2Error(w, fmt.Sprintf("protocol v2: %v", err)); sendErr != nil {
-			return sendErr
-		}
-		return endResponse(w)
+		return sendV2Error(w, fmt.Sprintf("protocol v2: %v", err))
 	}
 
 	if err := w.WriteLine("size"); err != nil {
@@ -101,10 +98,15 @@ func (h *Helper) objectSizes(ctx context.Context, oids []string) (map[string]int
 	// narrating and no filter to apply: the client asked about these
 	// specifically, and skipping one would leave a line out of the response.
 	st, cleanup, err := h.newStagingArea("", false)
+	if cleanup != nil {
+		// Deferred before the error check: a staging directory can exist by
+		// the time the error is reported, and the cleanup returned alongside
+		// is the only handle on it.
+		defer cleanup()
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer cleanup()
 
 	store, err := git.OpenObjectStore(st.dir)
 	if err != nil {
