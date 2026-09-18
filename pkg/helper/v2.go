@@ -85,9 +85,10 @@ func (h *Helper) v2Head(ctx context.Context, refs map[string]oci.RefEntry) strin
 // which is exactly what git-remote-http does. This file is that server: pkt-line
 // framing (pktline.go), a capability advertisement, `ls-refs`, and `fetch`.
 //
-// It is off by default and enabled with `ociremote.protocolV2`. The simple path
-// works and is well covered; this one is newer and speaks an interface
-// gitremote-helpers(7) calls "experimental; for internal use only".
+// It is on by default and `ociremote.protocolV2=false` turns it off; see
+// defaultProtocolV2. The simple path works and is well covered, and it is what
+// the helper falls back to. This one speaks an interface gitremote-helpers(7)
+// calls "experimental; for internal use only".
 
 // v2Agent identifies this implementation in the capability advertisement.
 const v2Agent = "git-remote-oci"
@@ -427,7 +428,17 @@ func shallowBoundary(stage string, tips []string, shallow shallowArgs) (map[stri
 func (h *Helper) v2LsRefs(ctx context.Context, w *pktWriter, req v2Request) error {
 	refs, err := h.v2RemoteRefs(ctx)
 	if err != nil {
-		return fmt.Errorf("ls-refs: %w", err)
+		// As an ERR packet, for the reason v2Fetch gives: it is the only
+		// thing git shows verbatim. Without it a registry refusing the
+		// credentials reached the user as "the remote end hung up
+		// unexpectedly", which is the least useful thing it could say about
+		// a 401. Still an error afterwards: the exit status is what a script
+		// reads.
+		err = fmt.Errorf("ls-refs: %w", err)
+		if sendErr := sendV2Error(w, err.Error()); sendErr != nil {
+			return sendErr
+		}
+		return err
 	}
 
 	prefixes := req.values("ref-prefix ")
@@ -647,8 +658,16 @@ var errWantNotServed = errors.New("protocol v2: fetch")
 
 // sendV2Error reports a fatal condition to the client. git recognises a packet
 // beginning with "ERR " anywhere in a response and dies with the text.
+//
+// The message is cut to what one packet can carry, the way sendSidebandError
+// does: a registry's error body can run to pages, and refusing to frame it
+// would leave the client with no message at all.
 func sendV2Error(w *pktWriter, msg string) error {
-	if err := w.WriteLine("ERR %s", msg); err != nil {
+	const prefix = "ERR "
+	if limit := pktMaxPayload - len(prefix) - 1; len(msg) > limit { // -1 for the LF
+		msg = msg[:limit]
+	}
+	if err := w.WriteLine("%s%s", prefix, msg); err != nil {
 		return err
 	}
 	return endResponse(w)
@@ -1322,13 +1341,45 @@ func (h *Helper) stagePackfile(ctx context.Context, sha string, manifest *ocispe
 	cmd := stagingGit(ctx, st.env, "index-pack", "--stdin", "--fix-thin")
 	cmd.Stdin = stream
 	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	// Keep what index-pack says, as buildPackForWants does for pack-objects.
+	// A packfile that fails to index is a registry serving something wrong,
+	// and index-pack's one line about it -- a bad object, a truncated
+	// stream, a missing base -- is the only account there is. Bounded,
+	// because its stderr is a subprocess's to fill.
+	stderr := &boundedBuffer{limit: 4096}
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		return err
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("index-pack: %w: %s", err, msg)
+		}
+		return fmt.Errorf("index-pack: %w", err)
 	}
 
 	return h.downloadLFSObjects(ctx, sha, manifest, st.filter)
 }
+
+// boundedBuffer keeps the first limit bytes written to it and drops the rest,
+// so that a subprocess's diagnostics can be captured without letting the
+// subprocess decide how much memory that takes.
+type boundedBuffer struct {
+	buf   []byte
+	limit int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - len(b.buf); room > 0 {
+		if len(p) > room {
+			b.buf = append(b.buf, p[:room]...)
+		} else {
+			b.buf = append(b.buf, p...)
+		}
+	}
+	// Reported as fully written: a short write would make the subprocess
+	// see a broken pipe and stop, and the point is that it does not.
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string { return string(b.buf) }
 
 // stagingParent picks where the staging object store is created.
 //

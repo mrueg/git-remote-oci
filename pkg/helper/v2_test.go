@@ -64,6 +64,7 @@ func instrumentSubprocessCoverage(t *testing.T) {
 }
 
 func v2setup(t *testing.T) string {
+	t.Helper()
 	url, _ := v2setupRegistry(t)
 	return url
 }
@@ -73,7 +74,7 @@ func v2setupRegistry(t *testing.T) (string, *mockRegistry) {
 	t.Helper()
 	binDir := t.TempDir()
 	bin := filepath.Join(binDir, "git-remote-oci")
-	if out, err := exec.Command("go", buildArgs(bin)...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", buildArgs(bin)...).CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -87,7 +88,7 @@ func v2setupRegistry(t *testing.T) (string, *mockRegistry) {
 
 func v2run(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(gitEnvWithoutGitDir(), extraEnv...)
 	cmd.Env = append(cmd.Env,
@@ -795,10 +796,10 @@ func TestSetHeadChangesWhatACloneChecksOut(t *testing.T) {
 
 	// Move it.
 	bin := filepath.Join(t.TempDir(), "git-remote-oci")
-	if out, err := exec.Command("go", buildArgs(bin)...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", buildArgs(bin)...).CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	setHead := exec.Command(bin, "set-head", url, "trunk")
+	setHead := exec.CommandContext(t.Context(), bin, "set-head", url, "trunk")
 	setHead.Env = append(os.Environ(), "OCI_INSECURE=1")
 	if out, err := setHead.CombinedOutput(); err != nil {
 		t.Fatalf("set-head: %v\n%s", err, out)

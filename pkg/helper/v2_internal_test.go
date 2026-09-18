@@ -256,7 +256,7 @@ func TestMissingObjects(t *testing.T) {
 	repo := t.TempDir()
 	run := func(args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = repo
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@example.com",
@@ -404,6 +404,28 @@ func TestSendSidebandErrorUsesBandThree(t *testing.T) {
 	// reporting the failure it was just told about.
 	if !strings.HasSuffix(buf.String(), "00000002") {
 		t.Errorf("response does not end with a flush and response-end: %q", buf.String())
+	}
+}
+
+// TestSendV2ErrorTruncatesAnOversizedMessage: a registry's error body can run
+// to pages, and an ERR packet that cannot be framed is no message at all.
+func TestSendV2ErrorTruncatesAnOversizedMessage(t *testing.T) {
+	var buf strings.Builder
+	if err := sendV2Error(newPktWriter(&buf), strings.Repeat("x", pktMaxPayload*2)); err != nil {
+		t.Fatalf("an oversized message was not truncated but refused: %v", err)
+	}
+	payload, kind, err := newPktReader(strings.NewReader(buf.String())).Read()
+	if err != nil || kind != pktData {
+		t.Fatalf("first packet is (%v, %v), want a data packet", kind, err)
+	}
+	if len(payload) != pktMaxPayload {
+		t.Errorf("payload is %d bytes, want it cut to the pkt-line maximum of %d", len(payload), pktMaxPayload)
+	}
+	if !strings.HasPrefix(string(payload), "ERR ") {
+		t.Errorf("truncation lost the ERR marker: %q", payload[:8])
+	}
+	if !strings.HasSuffix(buf.String(), "00000002") {
+		t.Errorf("error response does not end with a flush and response-end: %q", buf.String()[len(buf.String())-16:])
 	}
 }
 
