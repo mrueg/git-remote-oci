@@ -41,14 +41,14 @@ func buildPackfile(t *testing.T) []byte {
 	}
 
 	gitDir := filepath.Join(srcDir, ".git")
-	revList := exec.Command("git", "--git-dir="+gitDir, "rev-list", "--objects", "--all")
+	revList := exec.CommandContext(t.Context(), "git", "--git-dir="+gitDir, "rev-list", "--objects", "--all")
 	objects, err := revList.Output()
 	if err != nil {
 		t.Fatalf("rev-list: %v", err)
 	}
 
 	prefix := filepath.Join(t.TempDir(), "pack")
-	packCmd := exec.Command("git", "--git-dir="+gitDir, "pack-objects", prefix)
+	packCmd := exec.CommandContext(t.Context(), "git", "--git-dir="+gitDir, "pack-objects", prefix)
 	packCmd.Stdin = bytes.NewReader(objects)
 	if out, err := packCmd.CombinedOutput(); err != nil {
 		t.Fatalf("pack-objects: %v: %s", err, out)
@@ -70,7 +70,7 @@ func newBareRepo(t *testing.T) (string, *git.Repository) {
 	t.Helper()
 
 	dir := t.TempDir()
-	if out, err := exec.Command("git", "init", "--bare", dir).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "git", "init", "--bare", dir).CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare: %v: %s", err, out)
 	}
 	t.Setenv("GIT_DIR", dir)

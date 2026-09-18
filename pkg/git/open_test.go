@@ -22,7 +22,7 @@ func initRepo(t *testing.T, dir string, bare bool) {
 		args = append(args, "--bare")
 	}
 	args = append(args, dir)
-	if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "git", args...).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
 }
@@ -56,10 +56,8 @@ func TestOpenRepositoryDiscoversFromWorkingDirectory(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 
-	t.Setenv("GIT_DIR", "")
-	os.Unsetenv("GIT_DIR")
-	restore := chdir(t, nested)
-	defer restore()
+	unsetGitDir(t)
+	t.Chdir(nested)
 
 	if _, err := git.OpenRepository(); err != nil {
 		t.Fatalf("OpenRepository from a nested directory: %v", err)
@@ -68,9 +66,8 @@ func TestOpenRepositoryDiscoversFromWorkingDirectory(t *testing.T) {
 
 func TestOpenRepositoryFailsOutsideAnyRepository(t *testing.T) {
 	dir := t.TempDir()
-	os.Unsetenv("GIT_DIR")
-	restore := chdir(t, dir)
-	defer restore()
+	unsetGitDir(t)
+	t.Chdir(dir)
 
 	if _, err := git.OpenRepository(); err == nil {
 		t.Error("OpenRepository succeeded outside a repository")
@@ -87,16 +84,15 @@ func TestOpenRepositoryWithBogusGitDirFallsBack(t *testing.T) {
 	}
 }
 
-// chdir changes directory for the duration of a test. t.Chdir exists in newer
-// Go, but doing it explicitly keeps the restore visible.
-func chdir(t *testing.T, dir string) func() {
+// unsetGitDir removes GIT_DIR from the environment for the duration of a test.
+//
+// The discovery paths are only taken when GIT_DIR is absent, and `go test`
+// under git -- a hook, say -- inherits one. There is no t.Unsetenv: t.Setenv
+// registers the restore, and the unset itself follows it.
+func unsetGitDir(t *testing.T) {
 	t.Helper()
-	prev, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
+	t.Setenv("GIT_DIR", "")
+	if err := os.Unsetenv("GIT_DIR"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
 	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Chdir: %v", err)
-	}
-	return func() { _ = os.Chdir(prev) }
 }
