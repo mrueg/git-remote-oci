@@ -3,7 +3,7 @@ package oci
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"sort"
 
 	opencontainers "github.com/opencontainers/go-digest"
@@ -41,53 +41,86 @@ const MediaTypePackChain = "application/vnd.git.repository.packchain.v1+json"
 //
 // The result is cached for the life of the client. It is read on the fetch path
 // and again when a push republishes it, and re-reading it would spend the round
-// trip this exists to save.
+// trip this exists to save. Only an answer is cached -- a chain, or the
+// knowledge that there is none. A read that failed is not an answer, and
+// remembering it as "no chain" is what made a push after a momentary registry
+// error republish the chain with every edge but its own missing.
 func (c *Client) FetchPackChain(ctx context.Context) (map[string][]string, bool) {
-	if cached, ok := c.packChain.Load().(map[string][]string); ok {
-		return cached, len(cached) > 0
+	chain, err := c.packChainCached(ctx)
+	if err != nil {
+		return map[string][]string{}, false
 	}
-
-	chain := c.fetchPackChainUncached(ctx)
-	c.packChain.Store(chain)
 	return chain, len(chain) > 0
 }
 
-func (c *Client) fetchPackChainUncached(ctx context.Context) map[string][]string {
+// packChainCached is FetchPackChain with the failure kept apart from the
+// absence, for the one caller that must treat them differently.
+func (c *Client) packChainCached(ctx context.Context) (map[string][]string, error) {
+	if cached, ok := c.packChain.Load().(map[string][]string); ok {
+		return cached, nil
+	}
+
+	chain, err := c.fetchPackChainUncached(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.packChain.Store(chain)
+	return chain, nil
+}
+
+// fetchPackChainUncached reads the published chain. An empty map with no error
+// means the repository publishes none; an error means it could not be read,
+// which says nothing about whether it exists.
+func (c *Client) fetchPackChainUncached(ctx context.Context) (map[string][]string, error) {
 	manifest, err := c.FetchManifest(ctx, TagRefIndex)
 	if err != nil {
-		return map[string][]string{}
-	}
-
-	var desc *ocispec.Descriptor
-	for i := range manifest.Layers {
-		if manifest.Layers[i].MediaType == MediaTypePackChain {
-			desc = &manifest.Layers[i]
-			break
+		if IsNotFound(err) {
+			return map[string][]string{}, nil
 		}
-	}
-	if desc == nil {
-		return map[string][]string{}
+		return nil, fmt.Errorf("failed to read the _refs manifest for the pack chain: %w", err)
 	}
 
-	rc, err := c.Repo.Fetch(ctx, *desc)
+	desc, found := packChainLayerOf(manifest)
+	if !found {
+		return map[string][]string{}, nil
+	}
+
+	data, err := c.fetchBlobBytes(ctx, desc, maxMetadataBytes, "the pack chain")
 	if err != nil {
-		return map[string][]string{}
+		if IsNotFound(err) {
+			// A manifest naming a blob the registry no longer has. That is a
+			// damaged repository rather than an unreachable one, and there is
+			// no chain to be had from it.
+			return map[string][]string{}, nil
+		}
+		return nil, fmt.Errorf("failed to read the pack chain: %w", err)
 	}
-	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(io.LimitReader(rc, desc.Size))
-	if err != nil {
-		return map[string][]string{}
-	}
+	return decodePackChain(data), nil
+}
 
+// decodePackChain parses a chain blob, and yields an empty chain for one that
+// cannot be parsed.
+//
+// That is deliberately not an error. Every use of the chain is an optimisation
+// over reading the annotations, so a chain that is unreadable costs round
+// trips and nothing else, the same as a chain that was never published.
+func decodePackChain(data []byte) map[string][]string {
 	var chain map[string][]string
 	if err := json.Unmarshal(data, &chain); err != nil {
-		// A chain that cannot be parsed is treated as one that is not there.
-		// Every use of it is an optimisation over reading the annotations, so
-		// discarding it costs round trips and nothing else.
 		return map[string][]string{}
 	}
 	return sanitisePackChain(chain)
+}
+
+// packChainLayerOf finds the chain layer on a _refs manifest.
+func packChainLayerOf(manifest *ocispec.Manifest) (ocispec.Descriptor, bool) {
+	for i := range manifest.Layers {
+		if manifest.Layers[i].MediaType == MediaTypePackChain {
+			return manifest.Layers[i], true
+		}
+	}
+	return ocispec.Descriptor{}, false
 }
 
 // sanitisePackChain drops anything that is not a pair of object ids.
@@ -169,7 +202,19 @@ func (c *Client) ResetPackChain() {
 func (c *Client) packChainLayer(ctx context.Context) (ocispec.Descriptor, bool) {
 	merged := map[string][]string{}
 	if !c.packChainReset.Load() {
-		for sha, bases := range c.fetchPackChainCached(ctx) {
+		published, err := c.packChainCached(ctx)
+		if err != nil {
+			// The published chain could not be read, so it cannot be merged
+			// with, and publishing this client's edges alone would replace
+			// the whole graph with a fragment of it. Carrying the previous
+			// layer forward unchanged loses only this push's edges, which a
+			// reader recovers from the annotations; losing the rest would
+			// cost every clone the round trips the chain exists to save.
+			c.warnf("the published pack chain could not be read and is left as it was; "+
+				"the edges from this push are not in it: %v", err)
+			return c.publishedPackChainLayer(ctx)
+		}
+		for sha, bases := range published {
 			merged[sha] = bases
 		}
 	}
@@ -216,9 +261,15 @@ func (c *Client) packChainLayer(ctx context.Context) (ocispec.Descriptor, bool) 
 	return desc, true
 }
 
-// fetchPackChainCached is FetchPackChain without the ok, for internal callers
-// that treat absent and empty the same way.
-func (c *Client) fetchPackChainCached(ctx context.Context) map[string][]string {
-	chain, _ := c.FetchPackChain(ctx)
-	return chain
+// publishedPackChainLayer returns the chain layer descriptor currently on the
+// _refs manifest, for a push that has to carry it forward without having been
+// able to read the chain itself. ok is false when there is none, or when the
+// manifest cannot be read either -- in which case the new _refs goes out
+// without a chain, and the next push that can read the registry starts one.
+func (c *Client) publishedPackChainLayer(ctx context.Context) (ocispec.Descriptor, bool) {
+	manifest, err := c.FetchManifest(ctx, TagRefIndex)
+	if err != nil {
+		return ocispec.Descriptor{}, false
+	}
+	return packChainLayerOf(manifest)
 }

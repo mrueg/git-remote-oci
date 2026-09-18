@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"sort"
 	"strconv"
@@ -300,24 +299,33 @@ func PackIndexRecordsSizes(manifest *ocispec.Manifest) bool {
 	return false
 }
 
+// maxPackIndexBytes bounds a pack index read into memory.
+//
+// It is its own limit rather than maxMetadataBytes because an index is
+// proportional to the *objects* in a packfile, not to the refs in the
+// repository: at 58 bytes a line, a gigabyte is about eighteen million objects
+// in one pack, which is past the largest packs in existence. As with the
+// metadata limit it is a backstop against a descriptor lying about its size,
+// not a quota.
+const maxPackIndexBytes = 1 << 30
+
 // FetchPackIndex downloads a manifest's pack index.
 //
 // ok is false when the manifest has no index or it could not be read, which
 // are the same thing to a caller: nothing is known about what that packfile
 // holds, so it cannot be ruled out. A repository pushed by an older build has
 // no indexes at all and must keep working, just without the shortcut.
+//
+// The blob is verified against the descriptor's digest before it is used. An
+// index that does not hash to what the manifest claims is not an index a
+// reader can act on: acting on it is how a pack that held the object gets
+// skipped, and that is the one answer this must never give.
 func (c *Client) FetchPackIndex(ctx context.Context, manifest *ocispec.Manifest) ([]byte, bool) {
 	desc, found := PackIndexLayer(manifest)
 	if !found {
 		return nil, false
 	}
-	rc, err := c.Repo.Fetch(ctx, desc)
-	if err != nil {
-		return nil, false
-	}
-	defer func() { _ = rc.Close() }()
-
-	data, err := io.ReadAll(io.LimitReader(rc, desc.Size))
+	data, err := c.fetchBlobBytes(ctx, desc, maxPackIndexBytes, "a pack index")
 	if err != nil {
 		return nil, false
 	}

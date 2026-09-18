@@ -80,9 +80,11 @@ func SnapshotLayer(manifest *ocispec.Manifest) (ocispec.Descriptor, bool) {
 	return ocispec.Descriptor{}, false
 }
 
-// FetchSnapshotStream reads a snapshot layer as an uncompressed packfile.
+// FetchSnapshotStream reads a snapshot layer as an uncompressed packfile. The
+// stream fails at the end, rather than reporting EOF, if the bytes do not match
+// the descriptor; see fetchBlob.
 func (c *Client) FetchSnapshotStream(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
-	rc, err := c.Repo.Fetch(ctx, desc)
+	rc, err := c.fetchBlob(ctx, desc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch the snapshot layer: %w", err)
 	}

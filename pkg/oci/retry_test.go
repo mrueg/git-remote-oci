@@ -181,3 +181,60 @@ func TestRetryTransportBodyRewind(t *testing.T) {
 		t.Errorf("Expected 2 attempts, got %d", attempts.Load())
 	}
 }
+
+// TestCalculateBackoffHonoursRetryAfter pins that a Retry-After is waited out
+// on its own ceiling. It used to be clamped to the backoff's maxInterval,
+// which left maxRetryAfter with nothing to do and retried into a registry
+// that had said when it would be ready.
+func TestCalculateBackoffHonoursRetryAfter(t *testing.T) {
+	rt := newRetryTransport(nil)
+	rt.maxInterval = 100 * time.Millisecond
+
+	if got := rt.calculateBackoff(0, 30*time.Second); got != 30*time.Second {
+		t.Errorf("Retry-After of 30s produced a wait of %v; it must be honoured past maxInterval", got)
+	}
+	if got := rt.calculateBackoff(0, 2*time.Hour); got != maxRetryAfter {
+		t.Errorf("Retry-After of 2h produced a wait of %v, want the %v ceiling", got, maxRetryAfter)
+	}
+	if got := rt.calculateBackoff(5, 0); got > rt.maxInterval {
+		t.Errorf("plain backoff of %v exceeds maxInterval %v", got, rt.maxInterval)
+	}
+}
+
+// TestRoundTripLeavesTheCallerBodyAlone: replaying a body on retry must happen
+// on the transport's own copy of the request. Reassigning Body on the caller's
+// request is the same contract violation as setting headers on it.
+func TestRoundTripLeavesTheCallerBodyAlone(t *testing.T) {
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+
+	rt := newRetryTransport(ts.Client().Transport)
+	rt.initialInterval = 10 * time.Millisecond
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, ts.URL, bytes.NewReader([]byte("payload")))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	original := req.Body
+
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if attempts.Load() != 2 {
+		t.Fatalf("expected a retry, got %d attempts", attempts.Load())
+	}
+	if req.Body != original {
+		t.Error("the transport replaced Body on the caller's request while retrying")
+	}
+}

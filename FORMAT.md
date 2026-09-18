@@ -126,15 +126,19 @@ A repository occupies one OCI repository. Everything lives under tags in that on
 
 | Tag | Holds | Mutable |
 | :--- | :--- | :--- |
-| `<40-hex commit id>` | commit manifest — a packfile and what it depends on | no, written once |
+| `<commit id>` (40 or 64 hex) | commit manifest — a packfile and what it depends on | no, written once |
 | `<encoded ref name>` | ref manifest — where a ref points, plus display metadata | yes |
 | `_refs` | the ref index: the authoritative list of refs | yes |
 | `_index` | an OCI image index over the same refs, for generic tooling | yes |
 | `_lfs_locks` | Git LFS lock records | yes |
 | `_lock_<encoded ref name>` | advisory ref lock | yes |
 
-Tags beginning with `_` are RESERVED. A writer MUST NOT publish a ref under a reserved tag, and
-MUST NOT place anything that is not a ref manifest outside that namespace.
+The tags `_refs`, `_index` and `_lfs_locks`, and every tag beginning with `_lock_`, are RESERVED. A
+writer MUST NOT publish a ref manifest under a reserved tag, and everything it publishes that is
+neither a commit manifest nor a ref manifest — the indexes, the locks — MUST live under a reserved
+tag. Beginning with `_` is not by itself what makes a tag reserved: the ref-name encoding (§3) also
+uses that namespace, for its `_t_`, `_r_`, `_x_` and `_h_` prefixes and for a branch whose own name
+begins with `_`.
 
 Object ids appearing in tags, annotations and index blobs MUST be lowercase hexadecimal. A reader
 MAY accept uppercase on input; a writer MUST NOT emit it.
@@ -183,7 +187,7 @@ necessary.
 
 An OCI tag MUST match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`. A Git ref name may contain `/` and much
 else, and the same short name may exist as both a branch and a tag. The mapping MUST therefore be
-**injective**: two distinct refs MUST NOT share a tag.
+**injective**: two distinct refs MUST NOT share a tag. §3.1 is the one qualified exception.
 
 ```
 refs/heads/<name>  ->           escape(<name>)
@@ -218,8 +222,10 @@ A ref whose encoding exceeds 128 bytes MUST be stored as:
 "_h_" + <encoded prefix> + "-" + <first 8 hex digits of sha256(ref name)>
 ```
 
-This is **lossy but still injective**: the tag cannot be decoded back to a ref name, so such refs
-are discoverable only through `_refs` (§6). Two distinct long refs still receive distinct tags.
+This is **lossy**, and it is the one place the mapping is not injective by construction: the tag
+cannot be decoded back to a ref name, so such refs are discoverable only through `_refs` (§6), and
+two distinct long refs receive distinct tags unless the first 32 bits of their digests collide. That
+is collision-resistant — unique in practice — rather than guaranteed.
 
 A reader enumerating tags MUST NOT attempt to decode a `_h_` tag to a ref name.
 
@@ -230,8 +236,8 @@ because a lone `_` is always followed by `_` or two hex digits and `h` is not he
 
 ### 3.2 Refs that look like commit ids
 
-A ref whose encoded tag is 40 hex characters would collide with the commit-manifest namespace. Such
-a ref manifest MUST be published under `ref-<tag>` instead.
+A ref whose encoded tag is 40 or 64 hexadecimal characters, in either case, would collide with the
+commit-manifest namespace. Such a ref manifest MUST be published under `ref-<tag>` instead.
 
 ---
 
@@ -503,7 +509,8 @@ server here to verify a certificate against.
 
 ## 6. `_refs` — the ref index
 
-`_refs` is the authoritative list of refs, and the only place the format version is recorded.
+`_refs` is the authoritative list of refs. It carries the format version, which `_index` (§7)
+mirrors and is checked for in the same way.
 
 Its `application/vnd.git.repository.index.v1+json` layer MUST be a JSON object mapping ref name to
 entry:
@@ -520,6 +527,7 @@ entry:
     "sha": "f0d5b61268be377529d6aa5585bd30226aab8d03",
     "tagger": "Alice <alice@example.com>",
     "tag_message": "release 1.0.0",
+    "tag_sig": "-----BEGIN PGP SIGNATURE-----\n…\n-----END PGP SIGNATURE-----\n",
     "tag_object": "9a1f2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3"
   }
 }
@@ -527,6 +535,12 @@ entry:
 
 Every field except `sha` is OPTIONAL. An entry MUST be a JSON object; a reader MUST reject a bare
 string.
+
+`tagger`, `tag_message`, `tag_sig` and `tag_object` mirror the ref manifest's annotations (§5):
+`tag_sig` is the annotated tag's signature block verbatim, the same value as
+`io.git-remote-oci.tag-signature`, so a reader listing refs can tell which tags are signed without
+resolving each manifest. The signature is recorded, not verified; there is no server here to verify
+it against.
 
 The manifest MUST carry `io.git-remote-oci.format-version`. A reader MUST check it before acting on
 anything in the repository, and MUST refuse a value it does not implement.
@@ -678,7 +692,13 @@ a registry that will not delete.
 Registries offer no compare-and-swap, so all locking here is **advisory**. It narrows the window for
 concurrent writers to clobber each other; it does not close it.
 
-A lock is a manifest under `_lock_<encoded ref name>` with no payload layer, carrying:
+A lock is a manifest with no payload layer, tagged `_lock_` followed by the ref name encoded by the
+§3 mapping **with a length budget of 122 bytes** (the 128-byte tag limit less the prefix). A ref
+whose §3 encoding is 122 bytes or shorter therefore has the lock tag `_lock_` + its ref tag; a
+longer one is truncated exactly as §3.1 describes, at the smaller budget, so that the whole tag fits
+the limit and distinct refs still receive distinct locks. The two truncation thresholds differ, so a
+ref may have an untruncated ref tag and a truncated lock tag; nothing ever derives one from the
+other. The manifest carries:
 
 | Annotation | Meaning |
 | :--- | :--- |
@@ -692,12 +712,23 @@ Acquisition MUST be: check, write, then read back and confirm the id is still ou
 A reader MUST honour expiry; an expired lock is not a lock.
 
 Releasing MUST write a tombstone with owner `released` rather than deleting, and MUST verify that
-the lock id matches before doing so.
+the lock id matches before doing so. A published lock with no id MUST be treated as someone
+else's: the id is the only evidence of ownership there is. When no live lock is published — none,
+a tombstone, or one that has expired — a release MUST NOT write anything: a client whose own lock
+has expired has nothing to release, and a tombstone written then would land on whatever lock
+another client has legitimately taken since.
 
 The prefix is inside the reserved namespace of §2, which the ref-name encoding cannot produce. A
 writer MUST NOT use a lock namespace a ref could encode into.
 
 The pseudo-ref `_refs_index_lock` serialises updates to `_refs` (§6).
+
+***Compatibility.*** The 122-byte budget did not bump the format version (§11). Locks are never
+enumerated to learn anything about a repository, and a writer consults only the lock for the ref it
+is about to write; for every ref whose encoding fits the budget the tag is byte-for-byte what it
+always was. A writer that did not apply the budget could not form the lock tag for a longer ref at
+all — the registry rejects a tag over the limit — so its push of such a ref failed before this
+change and fails the same way after it. Nothing is misread; nothing that used to work stops.
 
 ### 9.1 `_lfs_locks` — Git LFS file locks
 
