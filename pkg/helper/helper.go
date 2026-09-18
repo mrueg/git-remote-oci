@@ -131,7 +131,8 @@ const (
 	// seconds. A lock that expires mid-push is worse than no lock: another
 	// client acquires it legitimately and the two interleave exactly the
 	// update the lock exists to serialise. Erring long costs a ref blocked
-	// until the TTL runs out after a client dies.
+	// until the TTL runs out after a client dies. A push that approaches or
+	// outlives the TTL is warned about it; see watchRefLock.
 	defaultPushLockTTL = 10 * time.Minute
 
 	// defaultCompactAfter is how many published commits accumulate before a
@@ -1896,14 +1897,15 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			// path used to acquire, so two ordinary `git push` runs both saw an
 			// unlocked ref and both proceeded, and the lock constrained nobody
 			// except other --atomic pushers.
-			if _, lockErr := h.ociClient.AcquireRefLock(pCtx, dstRef, h.pushLockTTL); lockErr != nil {
+			release, lockErr := h.acquireRefLock(pCtx, dstRef)
+			if lockErr != nil {
 				if errors.Is(lockErr, oci.ErrRefLocked) {
 					return failReport(dstRef, "%v", lockErr)
 				}
 				return failReport(dstRef, "failed to acquire reference lock: %v", lockErr)
 			}
 			// Release even when the push failed; see releaseRefLock.
-			defer h.releaseRefLock(pCtx, dstRef)
+			defer release()
 		}
 
 		srcHash, err := h.gitRepo.ResolveRef(srcRef)
@@ -2128,6 +2130,76 @@ func (h *Helper) finishPushBatch(ctx context.Context, pushSpecs []string, report
 // the point where the user gave up on it.
 const refLockReleaseTimeout = 10 * time.Second
 
+// acquireRefLock takes a ref's push lock for pushLockTTL and returns the
+// function that gives it back.
+//
+// Both push paths go through here so that they cannot drift on TTL, release
+// policy, or the expiry warnings: the lock is watched from the moment it is
+// taken, and the returned release stops the watch before releasing, so no
+// warning can be printed about a lock that has already been given back.
+func (h *Helper) acquireRefLock(ctx context.Context, dstRef string) (release func(), err error) {
+	if _, err := h.ociClient.AcquireRefLock(ctx, dstRef, h.pushLockTTL); err != nil {
+		return nil, err
+	}
+	stop := h.watchRefLock(dstRef, h.pushLockTTL)
+	return func() {
+		stop()
+		h.releaseRefLock(ctx, dstRef)
+	}, nil
+}
+
+// refLockWarnFraction is how much of the TTL a lock may be held before the
+// push is warned that it is running long. Four fifths leaves a large push a
+// moment to be noticed before the lock lapses, without nagging one that is
+// merely slow.
+const refLockWarnFraction = 0.8
+
+// watchRefLock warns once when a ref's lock has been held for most of its TTL
+// and once more when the TTL has elapsed, if the push is still running at
+// those points. It returns the function that ends the watch.
+//
+// A lock that expires mid-push is worse than none: another client acquires it
+// legitimately and the two interleave exactly the update the lock exists to
+// serialise. The helper knows the TTL and when it took the lock, so it can say
+// so before it happens instead of leaving it to the release to notice, if the
+// release notices at all — an expired lock of ours is simply not there any
+// more. A push that finishes in time hears nothing.
+//
+// The timers do not keep the process alive, and the callbacks check under the
+// mutex that the watch has not been stopped, so stop returning guarantees
+// that nothing more is printed for this lock.
+func (h *Helper) watchRefLock(dstRef string, ttl time.Duration) (stop func()) {
+	var mu sync.Mutex
+	stopped := false
+	guarded := func(warn func()) func() {
+		return func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if !stopped {
+				warn()
+			}
+		}
+	}
+
+	warnAt := time.Duration(float64(ttl) * refLockWarnFraction)
+	nearly := time.AfterFunc(warnAt, guarded(func() {
+		h.logWarn("git-remote-oci: warning: the push of %s has held its lock for %s of the %s ociremote.pushLockTTL and is still running; once the TTL lapses another client may take the ref over. Raise ociremote.pushLockTTL for pushes this large.\n",
+			dstRef, warnAt, ttl)
+	}))
+	lapsed := time.AfterFunc(ttl, guarded(func() {
+		h.logWarn("git-remote-oci: warning: the lock on %s lapsed after %s with the push still running; the ref is no longer protected against a concurrent push, and the release will report whether another client took it over.\n",
+			dstRef, ttl)
+	}))
+
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = true
+		nearly.Stop()
+		lapsed.Stop()
+	}
+}
+
 // releaseRefLock gives a ref's push lock back.
 //
 // Detached from ctx so that a cancelled push still releases: the alternative
@@ -2268,13 +2340,13 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 
 		// Acquire distributed ref lock to prevent multi-developer race conditions
 		if !h.dryRun {
-			_, lockErr := h.ociClient.AcquireRefLock(ctx, dstRef, h.pushLockTTL)
+			release, lockErr := h.acquireRefLock(ctx, dstRef)
 			if lockErr != nil {
 				parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: fmt.Sprintf("reference is locked: %v", lockErr)}
 				hasValidationError = true
 				continue
 			}
-			defer h.releaseRefLock(ctx, dstRef)
+			defer release()
 		}
 
 		srcHash, err := h.gitRepo.ResolveRef(srcRef)
