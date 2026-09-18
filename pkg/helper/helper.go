@@ -170,7 +170,7 @@ func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper,
 	cfg := config.Load(remoteName)
 	client.ApplyConfig(cfg)
 
-	return &Helper{
+	h := &Helper{
 		in:              in,
 		out:             out,
 		ociClient:       client,
@@ -180,9 +180,16 @@ func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper,
 		pushLockTTL:     cfg.Duration(config.KeyPushLockTTL, defaultPushLockTTL),
 		shallowSnapshot: cfg.Bool(config.KeyShallowSnapshot, defaultShallowSnapshot),
 		protocolV2:      cfg.Bool(config.KeyProtocolV2, defaultProtocolV2),
-		compactAfter:    cfg.Int(config.KeyCompactAfter, defaultCompactAfter),
-		timer:           newPhaseTimer(os.Getenv),
-	}, nil
+		// Count, not Int: zero is a real setting here and means "never".
+		compactAfter: cfg.Count(config.KeyCompactAfter, defaultCompactAfter),
+		timer:        newPhaseTimer(os.Getenv),
+	}
+	// Registry-side warnings go through the helper's logger so they carry the
+	// same prefix as its own and can never reach stdout.
+	client.Warnf = func(format string, args ...any) {
+		h.logWarn("git-remote-oci: warning: "+format+"\n", args...)
+	}
+	return h, nil
 }
 
 type fetchSpec struct {
@@ -324,7 +331,10 @@ func (h *Helper) Run(ctx context.Context) error {
 					default:
 						h.printlnOut("unsupported")
 					}
-				case "depth", "deepen":
+				case "depth":
+					// gitremote-helpers(7) defines `depth`; the deepen-*
+					// options are `deepen-since`, `deepen-not` and
+					// `deepen-relative`, and a bare "deepen" is none of them.
 					depthVal, err := strconv.Atoi(parts[2])
 					if err == nil && depthVal >= 0 {
 						h.depth = depthVal
@@ -442,13 +452,15 @@ func (h *Helper) Run(ctx context.Context) error {
 	return h.flushBatches(ctx, &fetchBatch, &pushBatch)
 }
 
-// flushBatches runs whichever command batch has accumulated and terminates its
-// responses with the mandatory blank line.
+// flushBatches runs whichever command batch has accumulated and sees that its
+// responses are terminated with the mandatory blank line.
 //
 // The blank line is emitted even when the batch fails, because git reads
 // responses until it sees one. Returning early without it leaves git waiting on
 // a stream that is about to close, which surfaces as a confusing protocol error
-// rather than the real cause.
+// rather than the real cause. A push batch that gets as far as per-ref results
+// writes the line itself, so that what it does afterwards -- compaction -- runs
+// once git has been answered; see finishPushBatch.
 func (h *Helper) flushBatches(ctx context.Context, fetchBatch *[]fetchSpec, pushBatch *[]string) error {
 	switch {
 	case len(*fetchBatch) > 0:
@@ -461,18 +473,16 @@ func (h *Helper) flushBatches(ctx context.Context, fetchBatch *[]fetchSpec, push
 	case len(*pushBatch) > 0:
 		specs := *pushBatch
 		*pushBatch = nil
-		err := h.handlePushBatch(ctx, specs)
-		if err != nil {
+		if err := h.handlePushBatch(ctx, specs); err != nil {
 			// A batch-level failure (cannot open the repo, cannot determine
 			// remote state) is not attributable to one ref, so report it
 			// against every ref in the batch rather than dying silently.
 			for _, spec := range specs {
-				h.printfOut("error %s %v\n", pushSpecDst(spec), err)
+				h.printlnOut(errorLine(pushSpecDst(spec), "%v", err))
 			}
-			err = nil
+			h.printlnOut()
 		}
-		h.printlnOut()
-		return err
+		return nil
 	}
 	return nil
 }
@@ -495,31 +505,43 @@ func okReport(dstRef string) pushReport {
 }
 
 func failReport(dstRef, format string, a ...any) pushReport {
-	return pushReport{dstRef: dstRef, line: "error " + dstRef + " " + fmt.Sprintf(format, a...)}
+	return pushReport{dstRef: dstRef, line: errorLine(dstRef, format, a...)}
 }
 
-// headHintFor picks the branch a repository with no recorded HEAD should adopt.
+// errorLine formats one `error <ref> <why>` response.
+//
+// The reason is very often a registry's own words -- an HTTP error body, a
+// message from a proxy in between -- and those are not this helper's to trust
+// on the protocol stream. See sanitiseProtocolText.
+func errorLine(dstRef, format string, a ...any) string {
+	return "error " + dstRef + " " + sanitiseProtocolText(fmt.Sprintf(format, a...))
+}
+
+// sanitiseProtocolText makes untrusted text safe to carry on one protocol
+// line.
+//
+// stdout is line-delimited with no framing to hide behind, so a newline in a
+// registry's error message does not produce an odd-looking reason: it ends the
+// `error <ref>` line early and starts another, which git parses as a response
+// to a ref that was never in the batch. Every control character becomes a
+// space, so one message stays one line.
+func sanitiseProtocolText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// headHintForRefs picks the branch a repository with no recorded HEAD should
+// adopt, from the refs a push has just moved.
 //
 // The remote-helper protocol never tells the helper what the remote's default
 // branch ought to be, so the best available signal is the branch being pushed.
-// Only used when nothing is recorded yet; see PushRichRefIndexWithHead.
-func headHintFor(reports []pushReport) string {
-	best := ""
-	for _, r := range reports {
-		if !r.ok || !strings.HasPrefix(r.dstRef, "refs/heads/") {
-			continue
-		}
-		if r.dstRef == "refs/heads/main" || r.dstRef == "refs/heads/master" {
-			return r.dstRef
-		}
-		if best == "" || r.dstRef < best {
-			best = r.dstRef
-		}
-	}
-	return best
-}
-
-// headHintForRefs is headHintFor over a ref set rather than a report list.
+// Only used when nothing is recorded yet; see PushRichRefIndexWithHead. Passed
+// only what was pushed, never what was deleted: a deletion of refs/heads/main
+// is not a vote for it.
 func headHintForRefs(refs map[string]oci.RefEntry) string {
 	best := ""
 	for refName := range refs {
@@ -571,38 +593,51 @@ func pushSpecDst(spec string) string {
 // use the fast-forward state derived from these refs to decide whether a push
 // would clobber someone else's work, so silently reporting an empty remote here
 // turns an auth failure or a network blip into a forced overwrite of every ref.
+//
+// The same rule decides when to fall through to the next source: only when
+// the one before it found nothing there. Anything else it said is the answer.
+// The index is where a repository declares its format version, and a refusal
+// on those grounds used to be bypassed by the enumeration below, which reads
+// the ref tags without ever looking -- exactly the reader the version exists
+// to stop.
 func (h *Helper) discoverRemoteRefs(ctx context.Context) (map[string]oci.RefEntry, error) {
-	richRefs, indexErr := h.ociClient.FetchRichRefIndex(ctx)
-	if indexErr == nil && len(richRefs) > 0 {
+	richRefs, err := h.ociClient.FetchRichRefIndex(ctx)
+	if err != nil && !oci.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to determine remote refs: %w", err)
+	}
+	if len(richRefs) > 0 {
 		return richRefs, nil
 	}
 
-	refs, listErr := h.ociClient.ListRefs(ctx)
-	if listErr == nil && len(refs) > 0 {
-		out := make(map[string]oci.RefEntry, len(refs))
-		for refName, sha := range refs {
-			out[refName] = oci.RefEntry{SHA: sha}
-		}
-		return out, nil
+	refs, err := h.ociClient.ListRefs(ctx)
+	if err != nil && !oci.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to determine remote refs: %w", err)
+	}
+	if len(refs) > 0 {
+		return plainRefEntries(refs), nil
 	}
 
-	tagList, tagErr := h.ociClient.EnumerateTagRefs(ctx)
-	if tagErr == nil && len(tagList) > 0 {
-		out := make(map[string]oci.RefEntry, len(tagList))
-		for refName, sha := range tagList {
-			out[refName] = oci.RefEntry{SHA: sha}
-		}
-		return out, nil
+	tagList, err := h.ociClient.EnumerateTagRefs(ctx)
+	if err != nil && !oci.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to determine remote refs: %w", err)
+	}
+	if len(tagList) > 0 {
+		return plainRefEntries(tagList), nil
 	}
 
-	// Every source came back empty. That is only trustworthy if the sources
-	// that failed did so because nothing is there.
-	for _, err := range []error{indexErr, listErr, tagErr} {
-		if err != nil && !oci.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to determine remote refs: %w", err)
-		}
-	}
+	// Every source came back empty, and each was allowed to only because
+	// nothing is there.
 	return map[string]oci.RefEntry{}, nil
+}
+
+// plainRefEntries lifts a name-to-id map into index entries with no metadata,
+// which is all the fallback sources know.
+func plainRefEntries(refs map[string]string) map[string]oci.RefEntry {
+	out := make(map[string]oci.RefEntry, len(refs))
+	for refName, sha := range refs {
+		out[refName] = oci.RefEntry{SHA: sha}
+	}
+	return out
 }
 
 // v2RemoteRefs returns the published refs, discovering them once per process.
@@ -1172,7 +1207,10 @@ func (h *Helper) markShallowBoundary(sha string) error {
 	// is not already ".git". That is what this used to do, and in a bare
 	// repository, the shape every clone target has, it wrote the boundary into
 	// a directory that does not exist and the write simply failed.
-	gitDir, _ := git.GitDir()
+	//
+	// The common directory, not GIT_DIR: in a linked worktree GIT_DIR is the
+	// per-worktree directory and git reads the shallow file from the shared one.
+	gitDir, _ := git.CommonDir()
 	shallowPath := filepath.Join(gitDir, "shallow")
 
 	content, err := os.ReadFile(shallowPath)
@@ -1340,7 +1378,9 @@ func (h *Helper) uploadLFSObjects(ctx context.Context, srcHash plumbing.Hash, ha
 		return nil, nil
 	}
 
-	gitDir, _ := git.GitDir()
+	// git-lfs keeps its objects under the common directory, which in a linked
+	// worktree is not GIT_DIR.
+	gitDir, _ := git.CommonDir()
 
 	var (
 		mu    sync.Mutex
@@ -1401,7 +1441,7 @@ func (h *Helper) fetchFromSnapshots(ctx context.Context, specs []fetchSpec, kept
 			// base wanted it, which is a better error than this one.
 			h.logVerbose("git-remote-oci: [verbose] no snapshot lookup for %s: %v\n",
 				shortSHA(spec.sha), err)
-			return false, nil //nolint:nilerr // deliberate fallback to the full walk
+			return false, nil
 		}
 		desc, ok := oci.SnapshotLayer(manifest)
 		if !ok {
@@ -1575,7 +1615,8 @@ func (h *Helper) downloadLFSObjects(ctx context.Context, sha string, manifest *o
 	if manifest == nil {
 		return nil
 	}
-	gitDir, _ := git.GitDir()
+	// The common directory, as in uploadLFSObjects: git-lfs looks there.
+	gitDir, _ := git.CommonDir()
 
 	var lfsLayers []ocispec.Descriptor
 	for _, layer := range manifest.Layers {
@@ -1677,7 +1718,15 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			}
 		}
 
-		if tags, err := h.gitRepo.GetReachableTags(pushedHashes); err == nil && len(tags) > 0 {
+		tags, err := h.gitRepo.GetReachableTags(pushedHashes)
+		if err != nil {
+			// The branches still go: a tag walk that failed is no reason to
+			// refuse the push the user asked for. But pushing no tags without
+			// a word is the omission --follow-tags exists to prevent, so it
+			// is said out loud rather than passed over.
+			h.logWarn("git-remote-oci: warning: --follow-tags could not enumerate the reachable tags, so none were added: %v\n", err)
+		}
+		if len(tags) > 0 {
 			pushedDstRefs := make(map[string]bool)
 			for _, spec := range pushSpecs {
 				_, dstRef, ok := strings.Cut(strings.TrimPrefix(spec, "+"), ":")
@@ -1697,33 +1746,28 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 	}
 
 	if h.atomic {
-		return h.handlePushBatchAtomic(ctx, pushSpecs)
+		h.finishPushBatch(ctx, pushSpecs, h.handlePushBatchAtomic(ctx, pushSpecs))
+		return nil
 	}
 
+	// changed holds what this batch actually moved, and is all the index
+	// update is told about; see the comment above that call. deletedRefs is
+	// its counterpart for removals. Both are written by the workers.
+	changed := make(map[string]oci.RefEntry)
 	deletedRefs := make(map[string]bool)
-	var deletedMu sync.Mutex
+	var changedMu sync.Mutex
+
+	// pushed records a ref this batch moved: in the session cache, for the
+	// checks the other specs in the batch make, and in changed, for the index.
+	pushed := func(dstRef string, entry oci.RefEntry) {
+		h.recordRemoteRef(dstRef, entry)
+		changedMu.Lock()
+		changed[dstRef] = entry
+		changedMu.Unlock()
+	}
 
 	processSpec := func(pCtx context.Context, spec string) pushReport {
-		force := strings.HasPrefix(spec, "+")
-		spec = strings.TrimPrefix(spec, "+")
-
-		srcRef, dstRef, ok := strings.Cut(spec, ":")
-		if !ok {
-			srcRef = spec
-			dstRef = spec
-		}
-
-		if !strings.HasPrefix(dstRef, "refs/") {
-			if strings.HasPrefix(dstRef, "tags/") {
-				dstRef = "refs/" + dstRef
-			} else if tagInf, _ := h.gitRepo.GetAnnotatedTagInfo(srcRef); tagInf != nil {
-				dstRef = "refs/tags/" + dstRef
-			} else if strings.HasPrefix(srcRef, "refs/tags/") {
-				dstRef = "refs/tags/" + dstRef
-			} else {
-				dstRef = "refs/heads/" + dstRef
-			}
-		}
+		force, srcRef, dstRef := h.splitPushSpec(spec)
 
 		if srcRef == "" {
 			// Deletion ran before any dry-run check, so `git push --dry-run
@@ -1734,14 +1778,17 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 				return okReport(dstRef)
 			}
 
-			deletedMu.Lock()
-			deletedRefs[dstRef] = true
-			deletedMu.Unlock()
-
 			if err := h.ociClient.DeleteRef(pCtx, dstRef); err != nil {
 				return failReport(dstRef, "failed to delete remote ref: %v", err)
 			}
+			// Recorded only once the registry has agreed. Marking the ref
+			// deleted before asking let a refused deletion drop it from the
+			// index anyway, so the listing said it was gone while its tag
+			// stayed exactly where it was.
 			h.forgetRemoteRef(dstRef)
+			changedMu.Lock()
+			deletedRefs[dstRef] = true
+			changedMu.Unlock()
 			return okReport(dstRef)
 		}
 
@@ -1756,16 +1803,8 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 				}
 				return failReport(dstRef, "failed to acquire reference lock: %v", lockErr)
 			}
-			defer func() {
-				// Release even when the push failed, and even if pCtx has been
-				// cancelled: the alternative is holding the ref for the whole
-				// TTL over an error that took a moment to happen.
-				if relErr := h.ociClient.ReleaseRefLock(context.WithoutCancel(pCtx), dstRef); relErr != nil {
-					// A leaked lock expires on its TTL rather than wedging the
-					// ref permanently, so this is a warning, not a failure.
-					h.logWarn("git-remote-oci: warning: failed to release the lock on %s: %v\n", dstRef, relErr)
-				}
-			}()
+			// Release even when the push failed; see releaseRefLock.
+			defer h.releaseRefLock(pCtx, dstRef)
 		}
 
 		srcHash, err := h.gitRepo.ResolveRef(srcRef)
@@ -1807,34 +1846,17 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		}
 
 		commit, err := h.gitRepo.GetCommitInfo(srcHash)
-		var parentsStr string
-		if err == nil && len(commit.ParentHashes) > 0 {
-			parentSHAs := make([]string, len(commit.ParentHashes))
-			for i, p := range commit.ParentHashes {
-				parentSHAs[i] = p.String()
-			}
-			parentsStr = strings.Join(parentSHAs, ",")
+		if err != nil {
+			commit = nil
 		}
+		parentsStr := parentsOf(commit)
 
 		refTag := oci.EncodeRefTag(dstRef)
 		if refTag == "" {
 			return failReport(dstRef, "destination ref %q cannot be represented as an OCI tag", dstRef)
 		}
 
-		wantHash := srcHash
-		var tagAnnoMap map[string]string
-		var tagInfo *git.AnnotatedTagInfo
-		tagInf, _ := h.gitRepo.GetAnnotatedTagInfo(srcRef)
-		if tagInf != nil {
-			tagInfo = tagInf
-			tagAnnoMap = map[string]string{
-				oci.AnnotationGitTagger:     tagInfo.Tagger,
-				oci.AnnotationGitTagMessage: tagInfo.Message,
-				oci.AnnotationGitTagSig:     tagInfo.Signature,
-				oci.AnnotationGitTagObj:     tagInfo.ObjectHash,
-			}
-			wantHash = plumbing.NewHash(tagInfo.ObjectHash)
-		}
+		tagInfo, tagAnnoMap, wantHash := h.tagAnnotations(srcRef, srcHash)
 
 		if h.dryRun {
 			pr, pw := io.Pipe()
@@ -1852,27 +1874,14 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			return okReport(dstRef)
 		}
 
-		if tagAnnoMap == nil {
-			tagAnnoMap = make(map[string]string)
-		}
-		tagAnnoMap[ocispec.AnnotationTitle] = dstRef
-		tagAnnoMap[ocispec.AnnotationVendor] = "git-remote-oci"
-		tagAnnoMap[ocispec.AnnotationDocumentation] = "https://github.com/mrueg/git-remote-oci"
-		if commit != nil {
-			tagAnnoMap[ocispec.AnnotationAuthors] = commit.Author.Name + " <" + commit.Author.Email + ">"
-			tagAnnoMap[ocispec.AnnotationCreated] = commit.Author.When.UTC().Format(time.RFC3339)
-			msgLines := strings.Split(strings.TrimSpace(commit.Message), "\n")
-			if len(msgLines) > 0 && msgLines[0] != "" {
-				tagAnnoMap[ocispec.AnnotationDescription] = msgLines[0]
-			}
-		}
+		commitAnnotations(tagAnnoMap, dstRef, commit)
 
 		// Skip only when this process has already pushed both the commit
 		// manifest and this ref's manifest. Testing the commit alone would
 		// leave the ref tag missing from the registry, discoverable only via
 		// the _refs index.
 		if h.ociClient.IsRefFullyPushed(wantHash.String(), dstRef) {
-			h.recordRemoteRef(dstRef, refEntryFor(commitSHA, commit, tagInfo))
+			pushed(dstRef, refEntryFor(commitSHA, commit, tagInfo))
 			return okReport(dstRef)
 		}
 
@@ -1925,7 +1934,7 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			return failReport(dstRef, "%v", err)
 		}
 
-		h.recordRemoteRef(dstRef, refEntryFor(commitSHA, commit, tagInfo))
+		pushed(dstRef, refEntryFor(commitSHA, commit, tagInfo))
 		return okReport(dstRef)
 	}
 
@@ -1950,28 +1959,17 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 	// A dry run must leave the registry exactly as it found it, and the index
 	// update is a real write: it takes the _refs lock, pushes blobs and pushes a
 	// manifest.
-	if h.richRemoteRefs != nil && !h.dryRun {
-		deletedMu.Lock()
-		deletedSnapshot := make(map[string]bool, len(deletedRefs))
-		for k := range deletedRefs {
-			deletedSnapshot[k] = true
-		}
-		deletedMu.Unlock()
-
-		// Merge in refs other clients added while this push ran, minus the
-		// ones we just deleted.
-		if latestRemote, err := h.ociClient.FetchRichRefIndex(ctx); err == nil && len(latestRemote) > 0 {
-			h.refsMu.Lock()
-			for k, v := range latestRemote {
-				if !deletedSnapshot[k] {
-					if _, exists := h.richRemoteRefs[k]; !exists {
-						h.richRemoteRefs[k] = v
-					}
-				}
-			}
-			h.refsMu.Unlock()
-		}
-		if err := h.ociClient.PushRichRefIndexWithHead(ctx, h.richRemoteRefs, deletedSnapshot, headHintFor(reports)); err != nil {
+	//
+	// Only what this batch moved goes into it. The session's ref set is a
+	// snapshot taken at `list for-push`, and a ref another client advanced
+	// since then is not this push's to report: writing the whole snapshot put
+	// that ref back where it was. The index update merges these entries over
+	// whatever the registry holds *now*, so everything else is left as it is,
+	// and a batch that moved nothing has nothing to write. The snapshot is
+	// still what the fast-forward and force-with-lease checks above ran
+	// against, which is what it is for.
+	if !h.dryRun && (len(changed) > 0 || len(deletedRefs) > 0) {
+		if err := h.ociClient.PushRichRefIndexWithHead(ctx, changed, deletedRefs, headHintForRefs(changed)); err != nil {
 			// list prefers the _refs index over tag enumeration, so a ref whose
 			// index entry did not land is not reliably discoverable and the next
 			// push would compare against a stale value. Reporting these as
@@ -1985,6 +1983,20 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		}
 	}
 
+	h.finishPushBatch(ctx, pushSpecs, reports)
+	return nil
+}
+
+// finishPushBatch puts a batch's results on the wire and then, once git has
+// its answer, considers compacting.
+//
+// The terminating blank line is written here rather than by flushBatches so
+// that compaction really does run after git has been answered. Git reads a
+// batch's responses up to that line, and a repack that ran before it was
+// written delayed the answer by exactly the work maybeCompact promises not to
+// put in front of it -- and could still have changed the outcome, since
+// nothing had been committed to the wire yet.
+func (h *Helper) finishPushBatch(ctx context.Context, pushSpecs []string, reports []pushReport) {
 	pushed := false
 	for i, report := range reports {
 		if report.line == "" {
@@ -1995,55 +2007,145 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		pushed = pushed || report.ok
 		h.printlnOut(report.line)
 	}
+	h.printlnOut()
 
-	// After the results are on the wire, so a repository that has grown enough
-	// to be worth repacking does not delay the answer git is waiting for, and
-	// so nothing that happens here can change it.
 	if pushed {
 		h.maybeCompact(ctx)
 	}
+}
 
-	return nil
+// refLockReleaseTimeout bounds how long releasing a push lock may take. The
+// release runs after the push's own context is done with, so without a bound
+// of its own a registry that has stopped answering would hold the helper past
+// the point where the user gave up on it.
+const refLockReleaseTimeout = 10 * time.Second
+
+// releaseRefLock gives a ref's push lock back.
+//
+// Detached from ctx so that a cancelled push still releases: the alternative
+// is holding the ref for the whole TTL over an error that took a moment to
+// happen. A release that fails is a warning rather than a failure, because a
+// leaked lock expires on its TTL rather than wedging the ref permanently.
+func (h *Helper) releaseRefLock(ctx context.Context, dstRef string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refLockReleaseTimeout)
+	defer cancel()
+	if err := h.ociClient.ReleaseRefLock(releaseCtx, dstRef); err != nil {
+		h.logWarn("git-remote-oci: warning: failed to release the lock on %s: %v\n", dstRef, err)
+	}
+}
+
+// splitPushSpec parses one push line into the force marker, the source (empty
+// for a deletion) and the destination as a full ref name.
+func (h *Helper) splitPushSpec(spec string) (force bool, srcRef, dstRef string) {
+	force = strings.HasPrefix(spec, "+")
+	spec = strings.TrimPrefix(spec, "+")
+	srcRef, dstRef, ok := strings.Cut(spec, ":")
+	if !ok {
+		srcRef, dstRef = spec, spec
+	}
+	return force, srcRef, h.normaliseDst(srcRef, dstRef)
+}
+
+// normaliseDst places a destination git handed over without its refs/ prefix.
+//
+// An explicit tags/ goes under refs/; a source that is a tag, whether an
+// annotated object or merely named under refs/tags/, makes the destination a
+// tag too; anything else is a branch.
+func (h *Helper) normaliseDst(srcRef, dstRef string) string {
+	if strings.HasPrefix(dstRef, "refs/") {
+		return dstRef
+	}
+	if strings.HasPrefix(dstRef, "tags/") {
+		return "refs/" + dstRef
+	}
+	if tagInf, _ := h.gitRepo.GetAnnotatedTagInfo(srcRef); tagInf != nil {
+		return "refs/tags/" + dstRef
+	}
+	if strings.HasPrefix(srcRef, "refs/tags/") {
+		return "refs/tags/" + dstRef
+	}
+	return "refs/heads/" + dstRef
+}
+
+// parentsOf renders a commit's parents as the comma-separated list the
+// manifest's parents annotation carries. It is metadata; see FORMAT.md for
+// why fetch follows pack-bases and not this.
+func parentsOf(commit *object.Commit) string {
+	if commit == nil || len(commit.ParentHashes) == 0 {
+		return ""
+	}
+	parentSHAs := make([]string, len(commit.ParentHashes))
+	for i, p := range commit.ParentHashes {
+		parentSHAs[i] = p.String()
+	}
+	return strings.Join(parentSHAs, ",")
+}
+
+// tagAnnotations resolves what srcRef is a push of.
+//
+// For an annotated tag it returns the tag's metadata, the manifest annotations
+// that carry it, and the object the tag points at, which is what the packfile
+// is cut for: a manifest is tagged with a commit id and an annotated tag's own
+// object has none. For anything else the map is empty and the hash is srcHash.
+func (h *Helper) tagAnnotations(srcRef string, srcHash plumbing.Hash) (*git.AnnotatedTagInfo, map[string]string, plumbing.Hash) {
+	annotations := make(map[string]string)
+	tagInfo, _ := h.gitRepo.GetAnnotatedTagInfo(srcRef)
+	if tagInfo == nil {
+		return nil, annotations, srcHash
+	}
+	annotations[oci.AnnotationGitTagger] = tagInfo.Tagger
+	annotations[oci.AnnotationGitTagMessage] = tagInfo.Message
+	annotations[oci.AnnotationGitTagSig] = tagInfo.Signature
+	annotations[oci.AnnotationGitTagObj] = tagInfo.ObjectHash
+	return tagInfo, annotations, plumbing.NewHash(tagInfo.ObjectHash)
+}
+
+// commitAnnotations adds the standard OCI annotations describing the ref and
+// the commit at its tip to a ref manifest's annotation set.
+func commitAnnotations(annotations map[string]string, dstRef string, commit *object.Commit) {
+	annotations[ocispec.AnnotationTitle] = dstRef
+	annotations[ocispec.AnnotationVendor] = "git-remote-oci"
+	annotations[ocispec.AnnotationDocumentation] = "https://github.com/mrueg/git-remote-oci"
+	if commit == nil {
+		return
+	}
+	annotations[ocispec.AnnotationAuthors] = commit.Author.Name + " <" + commit.Author.Email + ">"
+	annotations[ocispec.AnnotationCreated] = commit.Author.When.UTC().Format(time.RFC3339)
+	msgLines := strings.Split(strings.TrimSpace(commit.Message), "\n")
+	if len(msgLines) > 0 && msgLines[0] != "" {
+		annotations[ocispec.AnnotationDescription] = msgLines[0]
+	}
 }
 
 type parsedPushSpec struct {
-	force         bool
-	isDelete      bool
-	srcRef        string
-	dstRef        string
-	srcHash       plumbing.Hash
+	force    bool
+	isDelete bool
+	srcRef   string
+	dstRef   string
+	srcHash  plumbing.Hash
+	// wantHash is what the packfile is cut for: the target of an annotated
+	// tag, and otherwise srcHash. See tagAnnotations.
+	wantHash      plumbing.Hash
 	commitSHA     string
+	commit        *object.Commit
+	tagInfo       *git.AnnotatedTagInfo
+	tagAnnoMap    map[string]string
 	parentsStr    string
 	refTag        string
 	haveHashes    []plumbing.Hash
 	validationErr string
 }
 
-func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) error {
+// handlePushBatchAtomic pushes a batch all-or-nothing, as far as a registry
+// with no transactions allows, and returns one report per spec. Writing them,
+// and the terminator, is finishPushBatch's job.
+func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) []pushReport {
 	parsedSpecs := make([]parsedPushSpec, len(pushSpecs))
 	hasValidationError := false
 
 	// Phase 1: Pre-push validation for all specs in the batch
 	for i, spec := range pushSpecs {
-		force := strings.HasPrefix(spec, "+")
-		spec = strings.TrimPrefix(spec, "+")
-		srcRef, dstRef, ok := strings.Cut(spec, ":")
-		if !ok {
-			srcRef = spec
-			dstRef = spec
-		}
-
-		if !strings.HasPrefix(dstRef, "refs/") {
-			if strings.HasPrefix(dstRef, "tags/") {
-				dstRef = "refs/" + dstRef
-			} else if tagInf, _ := h.gitRepo.GetAnnotatedTagInfo(srcRef); tagInf != nil {
-				dstRef = "refs/tags/" + dstRef
-			} else if strings.HasPrefix(srcRef, "refs/tags/") {
-				dstRef = "refs/tags/" + dstRef
-			} else {
-				dstRef = "refs/heads/" + dstRef
-			}
-		}
+		force, srcRef, dstRef := h.splitPushSpec(spec)
 
 		// An empty source means "delete this ref". The non-atomic path has
 		// always handled it; without this branch `git push --atomic :branch`
@@ -2055,20 +2157,13 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 
 		// Acquire distributed ref lock to prevent multi-developer race conditions
 		if !h.dryRun {
-			_, lockErr := h.ociClient.AcquireRefLock(ctx, dstRef, 0)
+			_, lockErr := h.ociClient.AcquireRefLock(ctx, dstRef, h.pushLockTTL)
 			if lockErr != nil {
 				parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: fmt.Sprintf("reference is locked: %v", lockErr)}
 				hasValidationError = true
 				continue
 			}
-			defer func(ref string) {
-				// Detach from ctx so a cancelled push still releases its locks.
-				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-				defer cancel()
-				if err := h.ociClient.ReleaseRefLock(releaseCtx, ref); err != nil {
-					h.logWarn("git-remote-oci: warning: failed to release lock on %s: %v\n", ref, err)
-				}
-			}(dstRef)
+			defer h.releaseRefLock(ctx, dstRef)
 		}
 
 		srcHash, err := h.gitRepo.ResolveRef(srcRef)
@@ -2122,16 +2217,6 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			continue
 		}
 
-		commit, err := h.gitRepo.GetCommitInfo(srcHash)
-		var parentsStr string
-		if err == nil && len(commit.ParentHashes) > 0 {
-			parentSHAs := make([]string, len(commit.ParentHashes))
-			for j, p := range commit.ParentHashes {
-				parentSHAs[j] = p.String()
-			}
-			parentsStr = strings.Join(parentSHAs, ",")
-		}
-
 		refTag := oci.EncodeRefTag(dstRef)
 		if refTag == "" {
 			parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: fmt.Sprintf("destination ref %q cannot be represented as an OCI tag", dstRef)}
@@ -2139,17 +2224,29 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			continue
 		}
 
+		commit, err := h.gitRepo.GetCommitInfo(srcHash)
+		if err != nil {
+			commit = nil
+		}
+		tagInfo, tagAnnoMap, wantHash := h.tagAnnotations(srcRef, srcHash)
+
 		parsedSpecs[i] = parsedPushSpec{
 			force:      force,
 			srcRef:     srcRef,
 			dstRef:     dstRef,
 			srcHash:    srcHash,
+			wantHash:   wantHash,
 			commitSHA:  commitSHA,
-			parentsStr: parentsStr,
+			commit:     commit,
+			tagInfo:    tagInfo,
+			tagAnnoMap: tagAnnoMap,
+			parentsStr: parentsOf(commit),
 			refTag:     refTag,
 			haveHashes: haveHashes,
 		}
 	}
+
+	reports := make([]pushReport, len(parsedSpecs))
 
 	// Phase 2: If pre-push validation failed for ANY ref in atomic batch, abort all
 	if hasValidationError {
@@ -2159,103 +2256,60 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 				dst = pushSpecs[i]
 			}
 			if parsed.validationErr != "" {
-				h.printfOut("error %s %s\n", dst, parsed.validationErr)
+				reports[i] = failReport(dst, "%s", parsed.validationErr)
 			} else {
-				h.printfOut("error %s atomic push failed: pre-push validation error in batch\n", dst)
+				reports[i] = failReport(dst, "atomic push failed: pre-push validation error in batch")
 			}
 		}
-		return nil
+		return reports
 	}
 
 	if h.dryRun {
-		for _, parsed := range parsedSpecs {
+		for i, parsed := range parsedSpecs {
 			if parsed.isDelete {
 				h.logInfo("git-remote-oci: (atomic dry-run) verified deletion of %s\n", parsed.dstRef)
-				h.printfOut("ok %s\n", parsed.dstRef)
+				reports[i] = okReport(parsed.dstRef)
 				continue
 			}
 			pr, pw := io.Pipe()
 			go func(p parsedPushSpec) {
-				err := h.gitRepo.CreatePackfileTo(pw, p.srcHash, p.haveHashes)
+				err := h.gitRepo.CreatePackfileTo(pw, p.wantHash, p.haveHashes)
 				_ = pw.CloseWithError(err)
 			}(parsed)
 			_, err := io.Copy(io.Discard, pr)
 			_ = pr.Close()
 			if err != nil {
-				h.printfOut("error %s dry-run packfile generation failed: %v\n", parsed.dstRef, err)
+				reports[i] = failReport(parsed.dstRef, "dry-run packfile generation failed: %v", err)
 				continue
 			}
 			h.logInfo("git-remote-oci: (atomic dry-run) verified push for commit %s to OCI tag %s (%s)\n", parsed.commitSHA, parsed.refTag, parsed.dstRef)
 			h.logVerbose("git-remote-oci: [verbose] atomic dry-run packfile verification succeeded for commit %s\n", parsed.commitSHA)
-			h.printfOut("ok %s\n", parsed.dstRef)
+			reports[i] = okReport(parsed.dstRef)
 		}
-		return nil
+		return reports
 	}
 
 	// Phase 3: Push commit streams & ref manifests without updating _refs index
-	updatedRefs := make(map[string]string)
-	for k, v := range h.remoteRefs {
-		updatedRefs[k] = v
-	}
-
-	updatedRichRefs := make(map[string]oci.RefEntry)
-	for k, v := range h.richRemoteRefs {
-		updatedRichRefs[k] = v
-	}
+	changed := make(map[string]oci.RefEntry)
+	deletedRefs := make(map[string]bool)
 
 	var pushErr error
 	failedDstRef := ""
 	var rollback []oci.RefTagSnapshot
 
-	deletedRefs := make(map[string]bool)
-
 	for _, parsed := range parsedSpecs {
 		if parsed.isDelete {
-			if err := h.ociClient.DeleteRef(ctx, parsed.dstRef); err != nil {
-				pushErr = err
-				failedDstRef = parsed.dstRef
-				break
-			}
-			deletedRefs[parsed.dstRef] = true
-			delete(updatedRefs, parsed.dstRef)
-			delete(updatedRichRefs, parsed.dstRef)
+			// Deletions run after every upload has landed; see below.
 			continue
 		}
 
-		wantHash := parsed.srcHash
-		var tagAnnoMap map[string]string
-		var tagInfo *git.AnnotatedTagInfo
-		if tagInf, _ := h.gitRepo.GetAnnotatedTagInfo(parsed.srcRef); tagInf != nil {
-			tagInfo = tagInf
-			tagAnnoMap = map[string]string{
-				oci.AnnotationGitTagger:     tagInfo.Tagger,
-				oci.AnnotationGitTagMessage: tagInfo.Message,
-				oci.AnnotationGitTagSig:     tagInfo.Signature,
-				oci.AnnotationGitTagObj:     tagInfo.ObjectHash,
-			}
-			wantHash = plumbing.NewHash(tagInfo.ObjectHash)
-		}
-
-		if tagAnnoMap == nil {
-			tagAnnoMap = make(map[string]string)
-		}
-		tagAnnoMap[ocispec.AnnotationTitle] = parsed.dstRef
-		tagAnnoMap[ocispec.AnnotationVendor] = "git-remote-oci"
-		tagAnnoMap[ocispec.AnnotationDocumentation] = "https://github.com/mrueg/git-remote-oci"
-		if commit, _ := h.gitRepo.GetCommitInfo(parsed.srcHash); commit != nil {
-			tagAnnoMap[ocispec.AnnotationAuthors] = commit.Author.Name + " <" + commit.Author.Email + ">"
-			tagAnnoMap[ocispec.AnnotationCreated] = commit.Author.When.UTC().Format(time.RFC3339)
-			msgLines := strings.Split(strings.TrimSpace(commit.Message), "\n")
-			if len(msgLines) > 0 && msgLines[0] != "" {
-				tagAnnoMap[ocispec.AnnotationDescription] = msgLines[0]
-			}
-		}
+		commitAnnotations(parsed.tagAnnoMap, parsed.dstRef, parsed.commit)
 
 		pr, pw := io.Pipe()
-		go func(p parsedPushSpec, wHash plumbing.Hash) {
-			err := h.gitRepo.CreatePackfileTo(pw, wHash, p.haveHashes)
+		go func(p parsedPushSpec) {
+			err := h.gitRepo.CreatePackfileTo(pw, p.wantHash, p.haveHashes)
 			_ = pw.CloseWithError(err)
-		}(parsed, wantHash)
+		}(parsed)
 
 		// An LFS failure here must fail the whole batch: the ref would otherwise
 		// be published referencing blobs the registry does not have.
@@ -2266,10 +2320,10 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			failedDstRef = parsed.dstRef
 			break
 		}
-		if snap, ok := h.snapshotLayer(ctx, parsed.commitSHA, wantHash); ok {
+		if snap, ok := h.snapshotLayer(ctx, parsed.commitSHA, parsed.wantHash); ok {
 			lfsDescs = append(lfsDescs, snap)
 		}
-		if idx, ok := h.packIndexLayer(ctx, wantHash, parsed.haveHashes); ok {
+		if idx, ok := h.packIndexLayer(ctx, parsed.wantHash, parsed.haveHashes); ok {
 			lfsDescs = append(lfsDescs, idx)
 		}
 
@@ -2297,7 +2351,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			RefTag:         parsed.refTag,
 			Parents:        parsed.parentsStr,
 			PackBases:      packBaseStrings(parsed.haveHashes),
-			TagAnnotations: tagAnnoMap,
+			TagAnnotations: parsed.tagAnnoMap,
 			ExtraLayers:    lfsDescs,
 		}, pr, 0)
 		stopPush()
@@ -2308,21 +2362,27 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			break
 		}
 		rollback = append(rollback, snap)
-		updatedRefs[parsed.dstRef] = parsed.commitSHA
+		changed[parsed.dstRef] = refEntryFor(parsed.commitSHA, parsed.commit, parsed.tagInfo)
+	}
 
-		entry := oci.RefEntry{SHA: parsed.commitSHA}
-		if commit, err := h.gitRepo.GetCommitInfo(parsed.srcHash); err == nil && commit != nil {
-			entry.Author = commit.Author.Name + " <" + commit.Author.Email + ">"
-			entry.Timestamp = commit.Author.When.Unix()
-			entry.Message = strings.TrimSpace(commit.Message)
+	// Deletions last, and only once every upload has landed. A deletion is
+	// the one step here that cannot be rolled back -- the manifest is gone
+	// from the registry -- so it has to be the step least likely to be
+	// followed by a failure, and it is also the cheapest. Running it first
+	// meant `git push --atomic origin :old new` deleted old and then failed
+	// on new, which is the half-applied batch --atomic promises not to leave.
+	if pushErr == nil {
+		for _, parsed := range parsedSpecs {
+			if !parsed.isDelete {
+				continue
+			}
+			if err := h.ociClient.DeleteRef(ctx, parsed.dstRef); err != nil {
+				pushErr = err
+				failedDstRef = parsed.dstRef
+				break
+			}
+			deletedRefs[parsed.dstRef] = true
 		}
-		if tagInfo != nil {
-			entry.Tagger = tagInfo.Tagger
-			entry.TagMessage = tagInfo.Message
-			entry.TagSig = tagInfo.Signature
-			entry.TagObject = tagInfo.ObjectHash
-		}
-		updatedRichRefs[parsed.dstRef] = entry
 	}
 
 	if pushErr != nil {
@@ -2335,7 +2395,8 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		// Best effort, not a transaction: the commit manifests and their blobs
 		// stay behind as garbage, and a registry that refuses deletion cannot
 		// have a newly created tag removed at all. Whatever could not be undone
-		// is reported rather than passed over.
+		// is reported rather than passed over -- which includes a ref this
+		// batch had already deleted before a later deletion failed.
 		var stranded []string
 		for _, snap := range rollback {
 			if err := h.ociClient.RestoreRefTag(context.WithoutCancel(ctx), snap); err != nil {
@@ -2343,52 +2404,48 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 				h.logWarn("git-remote-oci: warning: could not roll back %s: %v\n", snap.RefName, err)
 			}
 		}
+		for name := range deletedRefs {
+			stranded = append(stranded, name)
+			h.logWarn("git-remote-oci: warning: %s was deleted before the batch failed and cannot be put back\n", name)
+		}
 
-		for _, parsed := range parsedSpecs {
+		for i, parsed := range parsedSpecs {
 			switch {
 			case parsed.dstRef == failedDstRef:
-				h.printfOut("error %s %v\n", parsed.dstRef, pushErr)
+				reports[i] = failReport(parsed.dstRef, "%v", pushErr)
 			case slices.Contains(stranded, parsed.dstRef):
-				h.printfOut("error %s atomic push failed in %s, and this ref could not be rolled back\n", parsed.dstRef, failedDstRef)
+				reports[i] = failReport(parsed.dstRef, "atomic push failed in %s, and this ref could not be rolled back", failedDstRef)
 			default:
-				h.printfOut("error %s atomic push failed due to error in %s\n", parsed.dstRef, failedDstRef)
+				reports[i] = failReport(parsed.dstRef, "atomic push failed due to error in %s", failedDstRef)
 			}
 		}
-		return nil
+		return reports
 	}
 
-	// Phase 4: Atomic update of _refs index in single transaction
-	if latestRemote, err := h.ociClient.FetchRichRefIndex(ctx); err == nil && len(latestRemote) > 0 {
-		for k, v := range latestRemote {
-			if deletedRefs[k] {
-				continue
+	// Phase 4: Atomic update of _refs index in single transaction. Only what
+	// this batch moved is written; see handlePushBatch for why the session's
+	// snapshot of the other refs must not be.
+	if len(changed) > 0 || len(deletedRefs) > 0 {
+		if err := h.ociClient.PushRichRefIndexWithHead(ctx, changed, deletedRefs, headHintForRefs(changed)); err != nil {
+			for i, parsed := range parsedSpecs {
+				reports[i] = failReport(parsed.dstRef, "atomic push failed to update _refs index: %v", err)
 			}
-			if _, exists := updatedRichRefs[k]; !exists {
-				updatedRichRefs[k] = v
-			}
+			return reports
 		}
 	}
-	if err := h.ociClient.PushRichRefIndexWithHead(ctx, updatedRichRefs, deletedRefs, headHintForRefs(updatedRichRefs)); err != nil {
-		for _, parsed := range parsedSpecs {
-			h.printfOut("error %s atomic push failed to update _refs index: %v\n", parsed.dstRef, err)
-		}
-		return nil
+
+	// Batch push succeeded! Bring the session's view up to date and report ok
+	// for every spec.
+	for name, entry := range changed {
+		h.recordRemoteRef(name, entry)
 	}
-
-	// Batch push succeeded! Update remoteRefs and richRemoteRefs and output ok for all specs
-	h.refsMu.Lock()
-	h.remoteRefs = updatedRefs
-	h.richRemoteRefs = updatedRichRefs
-	h.remoteRefsKnown = true
-	h.refsMu.Unlock()
-
-	for _, parsed := range parsedSpecs {
-		h.printfOut("ok %s\n", parsed.dstRef)
+	for name := range deletedRefs {
+		h.forgetRemoteRef(name)
 	}
-
-	h.maybeCompact(ctx)
-
-	return nil
+	for i, parsed := range parsedSpecs {
+		reports[i] = okReport(parsed.dstRef)
+	}
+	return reports
 }
 
 // printlnOut and printfOut are the only sanctioned ways to write to stdout.

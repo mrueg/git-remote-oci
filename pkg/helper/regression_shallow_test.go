@@ -265,7 +265,7 @@ func fileHasLines(t *testing.T, path string) bool {
 func runGitOut(t *testing.T, gitDir string, args ...string) string {
 	t.Helper()
 
-	cmd := exec.Command("git", append([]string{"--git-dir=" + gitDir}, args...)...)
+	cmd := exec.CommandContext(t.Context(), "git", append([]string{"--git-dir=" + gitDir}, args...)...)
 	cmd.Env = gitEnvWithoutGitDir()
 	out, err := cmd.CombinedOutput()
 	if err != nil {

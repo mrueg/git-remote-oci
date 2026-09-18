@@ -18,11 +18,11 @@ import (
 // commitLFSPointer commits a pointer file and stores the object it points at in
 // the repository's local LFS store, which is the state git-lfs leaves behind
 // after a smudge.
-func commitLFSPointer(t *testing.T, dir, name string, payload []byte) (oid string, tip string) {
+func commitLFSPointer(t *testing.T, dir, name string, payload []byte) {
 	t.Helper()
 
 	sum := sha256.Sum256(payload)
-	oid = hex.EncodeToString(sum[:])
+	oid := hex.EncodeToString(sum[:])
 	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n",
 		oid, len(payload))
 
@@ -38,12 +38,12 @@ func commitLFSPointer(t *testing.T, dir, name string, payload []byte) (oid strin
 		t.Fatalf("write LFS object: %v", err)
 	}
 
-	return oid, commitFile(t, dir, name, pointer, "add "+name)
+	commitFile(t, dir, name, pointer, "add "+name)
 }
 
 // failBlobUpload makes the registry reject exactly the upload carrying payload,
 // leaving every other blob to the normal path.
-func failBlobUpload(reg *mockRegistry, payload []byte) func(http.ResponseWriter, *http.Request) bool {
+func failBlobUpload(payload []byte) func(http.ResponseWriter, *http.Request) bool {
 	return func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method != http.MethodPut || !strings.Contains(r.URL.Path, "/blobs/uploads/") {
 			return false
@@ -90,10 +90,10 @@ func TestAtomicPushFailsWhenAnLFSUploadFails(t *testing.T) {
 			t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
 
 			payload := []byte("large binary payload that must reach the registry")
-			_, _ = commitLFSPointer(t, src, "big.bin", payload)
+			commitLFSPointer(t, src, "big.bin", payload)
 
 			reg.mu.Lock()
-			reg.intercept = failBlobUpload(reg, payload)
+			reg.intercept = failBlobUpload(payload)
 			reg.mu.Unlock()
 
 			out, err := runHelper(t, registry, tc.script)
@@ -126,7 +126,7 @@ func TestAtomicPushUploadsLFSObjects(t *testing.T) {
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
 
 	payload := []byte("large binary payload that must reach the registry")
-	_, _ = commitLFSPointer(t, src, "big.bin", payload)
+	commitLFSPointer(t, src, "big.bin", payload)
 
 	script := "list for-push\noption atomic true\npush refs/heads/main:refs/heads/main\n\n"
 	if out, err := runHelper(t, registry, script); err != nil {

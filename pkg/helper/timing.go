@@ -81,6 +81,9 @@ func (t *phaseTimer) phase(name string) func() {
 }
 
 // report writes the breakdown, slowest phase first.
+//
+// The writer is stderr, a diagnostic channel: a write that fails has nowhere
+// better to be reported, so the errors are dropped.
 func (t *phaseTimer) report(w io.Writer) {
 	if t == nil || !t.enabled {
 		return
@@ -98,7 +101,7 @@ func (t *phaseTimer) report(w io.Writer) {
 	t.mu.Unlock()
 
 	if len(names) == 0 {
-		fmt.Fprintf(w, "git-remote-oci: [timing] %s wall, no phases recorded\n", round(wall))
+		_, _ = fmt.Fprintf(w, "git-remote-oci: [timing] %s wall, no phases recorded\n", round(wall))
 		return
 	}
 
@@ -113,14 +116,14 @@ func (t *phaseTimer) report(w io.Writer) {
 		}
 	}
 
-	fmt.Fprintf(w, "git-remote-oci: [timing] %s wall\n", round(wall))
+	_, _ = fmt.Fprintf(w, "git-remote-oci: [timing] %s wall\n", round(wall))
 	for _, name := range names {
-		fmt.Fprintf(w, "git-remote-oci: [timing]   %-*s  %9s  (%d call%s)\n",
+		_, _ = fmt.Fprintf(w, "git-remote-oci: [timing]   %-*s  %9s  (%d call%s)\n",
 			width, name, round(totals[name]), counts[name], plural(counts[name]))
 	}
 	// Said explicitly, because a reader who adds the column up and gets more
 	// than the wall clock will otherwise assume the numbers are wrong.
-	fmt.Fprint(w, "git-remote-oci: [timing]   phases overlap across workers, so these sum to more than the wall time\n")
+	_, _ = fmt.Fprint(w, "git-remote-oci: [timing]   phases overlap across workers, so these sum to more than the wall time\n")
 }
 
 // round trims a duration to something readable. Nanosecond precision on a

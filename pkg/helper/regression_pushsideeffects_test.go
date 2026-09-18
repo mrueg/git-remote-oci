@@ -11,8 +11,8 @@ import (
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
-// seedPush publishes refs/heads/main and returns the registry URL.
-func seedPush(t *testing.T, reg *mockRegistry, ts interface{ Close() }, registry, src string) {
+// seedPush publishes refs/heads/main to registry.
+func seedPush(t *testing.T, registry string) {
 	t.Helper()
 
 	if out, err := runHelper(t, registry, "list for-push\npush refs/heads/main:refs/heads/main\n\n"); err != nil {
@@ -49,7 +49,7 @@ func TestDryRunDoesNotDeleteRemoteRef(t *testing.T) {
 
 	src := newWorkRepo(t)
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
-	seedPush(t, reg, ts, registry, src)
+	seedPush(t, registry)
 
 	reg.mu.Lock()
 	reg.requests = nil
@@ -92,7 +92,7 @@ func TestDryRunDoesNotRewriteRefsIndex(t *testing.T) {
 
 	src := newWorkRepo(t)
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
-	seedPush(t, reg, ts, registry, src)
+	seedPush(t, registry)
 
 	reg.mu.Lock()
 	before := string(reg.manifests[oci.TagRefIndex])
@@ -140,7 +140,7 @@ func TestPushReportsErrorWhenRefsIndexUpdateFails(t *testing.T) {
 
 	src := newWorkRepo(t)
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
-	seedPush(t, reg, ts, registry, src)
+	seedPush(t, registry)
 
 	// Fail only the index write, leaving the commit and ref manifests to land
 	// normally, which is exactly the partial-failure shape that used to be
@@ -185,7 +185,7 @@ func TestNonAtomicPushAcquiresRefLock(t *testing.T) {
 
 	src := newWorkRepo(t)
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
-	seedPush(t, reg, ts, registry, src)
+	seedPush(t, registry)
 
 	// Another client holds the lock.
 	client, err := oci.NewClient(registry, true)
@@ -252,7 +252,7 @@ func TestPushReleasesRefLockOnFailure(t *testing.T) {
 
 	src := newWorkRepo(t)
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
-	seedPush(t, reg, ts, registry, src)
+	seedPush(t, registry)
 
 	// Diverge from the remote so the push is rejected *after* the lock has been
 	// taken: advance the remote by one commit, then replace that commit locally

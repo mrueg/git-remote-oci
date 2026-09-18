@@ -44,7 +44,7 @@ func TestConcurrentFetchProducesCleanProtocolOutput(t *testing.T) {
 
 	// Fetch them back into a fresh repository.
 	dstDir := t.TempDir()
-	if out, err := exec.Command("git", "init", "--bare", dstDir).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "git", "init", "--bare", dstDir).CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare: %v: %s", err, out)
 	}
 	t.Setenv("GIT_DIR", dstDir)
@@ -128,7 +128,7 @@ func TestFetchDoesNotPullUnrequestedRefs(t *testing.T) {
 	srcDir := t.TempDir()
 	run := func(args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = srcDir
 		// GIT_DIR must be absent, not empty: git rejects an empty value. An
 		// earlier subtest may have exported it via t.Setenv.
@@ -176,7 +176,7 @@ func TestFetchDoesNotPullUnrequestedRefs(t *testing.T) {
 	}
 
 	dstDir := t.TempDir()
-	if out, err := exec.Command("git", "init", "--bare", dstDir).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "git", "init", "--bare", dstDir).CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare: %v: %s", err, out)
 	}
 	t.Setenv("GIT_DIR", dstDir)
@@ -185,10 +185,10 @@ func TestFetchDoesNotPullUnrequestedRefs(t *testing.T) {
 		t.Fatalf("fetch failed: %v", err)
 	}
 
-	if out, err := exec.Command("git", "--git-dir="+dstDir, "cat-file", "-e", wantedSHA).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "git", "--git-dir="+dstDir, "cat-file", "-e", wantedSHA).CombinedOutput(); err != nil {
 		t.Errorf("requested commit %s is missing: %v: %s", wantedSHA, err, out)
 	}
-	if err := exec.Command("git", "--git-dir="+dstDir, "cat-file", "-e", unwantedSHA).Run(); err == nil {
+	if err := exec.CommandContext(t.Context(), "git", "--git-dir="+dstDir, "cat-file", "-e", unwantedSHA).Run(); err == nil {
 		t.Errorf("unrequested commit %s was fetched anyway", unwantedSHA)
 	}
 }

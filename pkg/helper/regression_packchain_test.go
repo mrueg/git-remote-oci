@@ -179,7 +179,7 @@ func TestPackChainStaleIsCorrectedByTheAnnotations(t *testing.T) {
 // v2seedSeparatePushes builds a linear history pushed one commit at a time, so
 // each commit gets its own manifest and the pack bases form a chain n deep. A
 // single push of n commits would produce one manifest and no chain at all.
-func v2seedSeparatePushes(t *testing.T, url string, n int) string {
+func v2seedSeparatePushes(t *testing.T, url string, n int) {
 	t.Helper()
 	src := t.TempDir()
 	git(t, src, "init", "-q", "-b", "main", src)
@@ -192,7 +192,6 @@ func v2seedSeparatePushes(t *testing.T, url string, n int) string {
 		git(t, src, "-C", src, "commit", "-q", "-m", "commit "+name)
 		git(t, src, "-C", src, "push", "-q", url, "main")
 	}
-	return src
 }
 
 // refsManifest returns the parsed `_refs` manifest.
