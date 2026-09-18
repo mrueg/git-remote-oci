@@ -25,11 +25,13 @@ type retryTransport struct {
 	maxRetries      int
 	initialInterval time.Duration
 	maxInterval     time.Duration
-	// observe, when set, is told each response's status code. It is how the
-	// client learns that its credentials were accepted at least once, which is
-	// what separates "these credentials are wrong" from "these credentials
-	// stopped working part-way through".
-	observe func(statusCode int)
+	// observe, when set, is shown each response. It is how the client learns
+	// that its credentials were accepted at least once, which is what
+	// separates "these credentials are wrong" from "these credentials stopped
+	// working part-way through". It gets the whole response rather than the
+	// status because *which* request succeeded matters: a 200 from the token
+	// endpoint says nothing about access to the repository.
+	observe func(resp *http.Response)
 }
 
 func newRetryTransport(base http.RoundTripper) *retryTransport {
@@ -84,10 +86,12 @@ func isMutableMetadataPath(path string) bool {
 // not return both a nil response and a nil error, and must never hand back a
 // response whose body it has already closed.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Clone before touching headers: the caller owns req, and mutating it is a
-	// contract violation that also races other users of the same request.
+	// Clone before touching anything: the caller owns req, and mutating it is a
+	// contract violation that also races other users of the same request. This
+	// used to clone only when headers were added, but the retry loop below
+	// also reassigns Body on each replay, which is the same violation.
+	req = req.Clone(req.Context())
 	if req.URL != nil && isMutableMetadataPath(req.URL.Path) {
-		req = req.Clone(req.Context())
 		req.Header.Set("Cache-Control", "no-cache")
 		req.Header.Set("Pragma", "no-cache")
 	}
@@ -126,7 +130,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		if t.observe != nil {
-			t.observe(resp.StatusCode)
+			t.observe(resp)
 		}
 
 		if !isRetriableStatus(resp.StatusCode) || attempt == t.maxRetries || !replayable {
@@ -168,10 +172,11 @@ func (t *retryTransport) wait(ctx context.Context, d time.Duration) error {
 
 func (t *retryTransport) calculateBackoff(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		if retryAfter > t.maxInterval {
-			return t.maxInterval
-		}
-		return retryAfter
+		// A Retry-After is the registry saying when it will serve us again, so
+		// it is honoured on its own ceiling rather than the backoff's: clamping
+		// it to maxInterval, as this used to, retried a 429 at five seconds
+		// when the registry had asked for thirty and got another 429 for it.
+		return min(retryAfter, maxRetryAfter)
 	}
 
 	backoffFloat := float64(t.initialInterval) * math.Pow(2, float64(attempt))
@@ -241,7 +246,11 @@ func isRetriableError(err error) bool {
 // maxRetryAfter bounds the delay a registry can request. The value is
 // registry-controlled, so it is both clamped and overflow-checked here rather
 // than trusting the caller to notice.
-const maxRetryAfter = time.Hour
+//
+// A minute, not an hour: a push that sits silent for an hour because a header
+// said so is indistinguishable from one that hung, and a registry asking for
+// longer than this is better reported than waited for.
+const maxRetryAfter = 60 * time.Second
 
 func parseRetryAfter(headerVal string) time.Duration {
 	headerVal = strings.TrimSpace(headerVal)

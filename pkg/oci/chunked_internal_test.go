@@ -53,6 +53,11 @@ type chunkedRegistry struct {
 	// failEveryPatch rejects every chunk, to drive an upload that gives up
 	// after making progress.
 	failEveryPatch bool
+	// loseFinalResponse keeps the bytes of the PATCH that completes a blob
+	// of blobSize bytes but answers it with a 500: the registry has
+	// everything, and the client was never told.
+	loseFinalResponse bool
+	blobSize          int
 }
 
 func (r *chunkedRegistry) handler(t *testing.T) http.Handler {
@@ -90,6 +95,11 @@ func (r *chunkedRegistry) handler(t *testing.T) http.Handler {
 				return
 			}
 			r.content = append(r.content, body...)
+			if r.loseFinalResponse && len(r.content) == r.blobSize {
+				r.loseFinalResponse = false
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			r.patches = append(r.patches, req.Header.Get("Content-Range"))
 			w.Header().Set("Location", "/v2/test/blobs/uploads/session")
 			w.Header().Set("Range", fmt.Sprintf("0-%d", len(r.content)-1))
@@ -144,9 +154,13 @@ func readAllOrFail(t *testing.T, req *http.Request) []byte {
 	}
 }
 
+// chunkedFixtureChunk is the upload chunk size every fixture uses. The tests
+// vary the blob size against it, never the other way round.
+const chunkedFixtureChunk = 4 << 10
+
 // chunkedFixture builds a client pointed at a chunked registry, plus a staged
-// blob of the given size.
-func chunkedFixture(t *testing.T, size int64, chunk int64) (*Client, *chunkedRegistry, ocispec.Descriptor, *os.File) {
+// blob of the given size, uploaded in chunkedFixtureChunk-byte pieces.
+func chunkedFixture(t *testing.T, size int64) (*Client, *chunkedRegistry, ocispec.Descriptor, *os.File) {
 	t.Helper()
 	reg := &chunkedRegistry{}
 	ts := httptest.NewServer(reg.handler(t))
@@ -156,7 +170,7 @@ func chunkedFixture(t *testing.T, size int64, chunk int64) (*Client, *chunkedReg
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	client.UploadChunkSize = chunk
+	client.UploadChunkSize = chunkedFixtureChunk
 
 	payload := make([]byte, size)
 	if _, err := rand.Read(payload); err != nil {
@@ -194,8 +208,8 @@ func assertUploaded(t *testing.T, reg *chunkedRegistry, desc ocispec.Descriptor)
 }
 
 func TestChunkedUploadSendsEveryByteOnce(t *testing.T) {
-	const size, chunk = 10 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	if err := client.pushBlobResumable(context.Background(), desc, file); err != nil {
 		t.Fatalf("pushBlobResumable: %v", err)
@@ -228,8 +242,8 @@ func TestChunkedUploadSendsEveryByteOnce(t *testing.T) {
 // and a client that re-sent from its own idea of the offset would duplicate the
 // chunk and fail the digest check.
 func TestChunkedUploadResumesAfterAFailedChunk(t *testing.T) {
-	const size, chunk = 10 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	reg.mu.Lock()
 	reg.failNextPatch = true
@@ -245,8 +259,8 @@ func TestChunkedUploadResumesAfterAFailedChunk(t *testing.T) {
 // TestChunkedUploadResumesWhenTheChunkWasLost covers the other half: the chunk
 // failed and the registry kept nothing, so the same bytes have to be sent again.
 func TestChunkedUploadResumesWhenTheChunkWasLost(t *testing.T) {
-	const size, chunk = 10 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	reg.mu.Lock()
 	reg.failNextPatch = true
@@ -264,8 +278,8 @@ func TestChunkedUploadResumesWhenTheChunkWasLost(t *testing.T) {
 // content crosses the wire, so trying costs a round trip rather than a
 // transfer.
 func TestChunkedUploadFallsBackWhenRefused(t *testing.T) {
-	const size, chunk = 10 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	reg.mu.Lock()
 	reg.refusePatch = true
@@ -305,8 +319,7 @@ func TestChunkedUploadFallsBackWhenRefused(t *testing.T) {
 // TestSmallBlobsAreNotChunked: below the threshold there is nothing to resume,
 // and the extra round trips would be spent for nothing.
 func TestSmallBlobsAreNotChunked(t *testing.T) {
-	const chunk = 4 << 10
-	client, reg, desc, file := chunkedFixture(t, 1<<10, chunk)
+	client, reg, desc, file := chunkedFixture(t, 1<<10)
 
 	if err := client.pushPackfileBlob(context.Background(), desc, file); err != nil {
 		t.Fatalf("pushPackfileBlob: %v", err)
@@ -322,7 +335,7 @@ func TestSmallBlobsAreNotChunked(t *testing.T) {
 // TestChunkingDisabledSendsWhole pins the escape hatch, for a registry that
 // mishandles PATCH in some way this cannot detect.
 func TestChunkingDisabledSendsWhole(t *testing.T) {
-	client, reg, desc, file := chunkedFixture(t, 10<<10, 4<<10)
+	client, reg, desc, file := chunkedFixture(t, 10<<10)
 	client.UploadChunkSize = 0
 
 	if err := client.pushPackfileBlob(context.Background(), desc, file); err != nil {
@@ -351,7 +364,7 @@ func TestChunkedUploadFallsBackOnAnyFirstChunkFailure(t *testing.T) {
 		http.StatusRequestedRangeNotSatisfiable,
 	} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			client, reg, desc, file := chunkedFixture(t, 10<<10, 4<<10)
+			client, reg, desc, file := chunkedFixture(t, 10<<10)
 			reg.mu.Lock()
 			reg.refusePatch = true
 			reg.patchStatus = status
@@ -373,8 +386,8 @@ func TestChunkedUploadFallsBackOnAnyFirstChunkFailure(t *testing.T) {
 // own timeout — hours of storage nobody can see or reclaim — and the spec has a
 // DELETE for exactly this case.
 func TestChunkedUploadCancelsTheSessionWhenItGivesUp(t *testing.T) {
-	const size, chunk = 20 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 20 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	// The first chunk lands, every one after it fails. That is the shape that
 	// must not fall back to a monolithic retry -- the session works, the
@@ -400,11 +413,39 @@ func TestChunkedUploadCancelsTheSessionWhenItGivesUp(t *testing.T) {
 // and a DELETE afterwards would ask the registry to discard what it just
 // accepted.
 func TestChunkedUploadDoesNotCancelAfterSuccess(t *testing.T) {
-	const size, chunk = 10 << 10, 4 << 10
-	client, reg, desc, file := chunkedFixture(t, size, chunk)
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
 
 	if err := client.pushBlobResumable(context.Background(), desc, file); err != nil {
 		t.Fatalf("pushBlobResumable: %v", err)
+	}
+	assertUploaded(t, reg, desc)
+
+	reg.mu.Lock()
+	cancelled := reg.cancelled
+	reg.mu.Unlock()
+	if cancelled {
+		t.Error("a completed upload was cancelled afterwards")
+	}
+}
+
+// TestChunkedUploadCompletesWhenTheFinalResponseIsLost.
+//
+// The last chunk lands and only its response is lost. The retry's probe then
+// finds the registry holding the whole blob, and there is nothing left to
+// send -- but the loop used to carry the failed PATCH's error out with it and
+// fail a push the registry had, in fact, fully accepted.
+func TestChunkedUploadCompletesWhenTheFinalResponseIsLost(t *testing.T) {
+	const size = 10 << 10
+	client, reg, desc, file := chunkedFixture(t, size)
+
+	reg.mu.Lock()
+	reg.loseFinalResponse = true
+	reg.blobSize = size
+	reg.mu.Unlock()
+
+	if err := client.pushBlobResumable(context.Background(), desc, file); err != nil {
+		t.Fatalf("an upload whose final response was lost should have completed: %v", err)
 	}
 	assertUploaded(t, reg, desc)
 

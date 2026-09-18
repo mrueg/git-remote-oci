@@ -158,7 +158,12 @@ func TestReleaseRefLockRefusesForeignLock(t *testing.T) {
 }
 
 // TestReleaseRefLockOnUnlockedRefIsNoOp: releasing something already released
-// or expired should not be an error.
+// or expired should not be an error, and should not write anything either.
+//
+// The server here is read-only, so a release that tried to write a tombstone
+// would fail on the write. It used to: the expired lock read as unlocked, the
+// ownership check passed, and the tombstone went out regardless -- over
+// whatever lock another client had taken in the meantime.
 func TestReleaseRefLockOnUnlockedRefIsNoOp(t *testing.T) {
 	ts := lockManifestServer(t, oci.LockTag("refs/heads/main"), map[string]string{
 		oci.AnnotationLockRef:       "refs/heads/main",
@@ -167,13 +172,8 @@ func TestReleaseRefLockOnUnlockedRefIsNoOp(t *testing.T) {
 	})
 	defer ts.Close()
 
-	// The expired lock reads as unlocked, so ownership verification passes and
-	// the release attempt proceeds; the read-only test server then rejects the
-	// write, which is fine - what matters is that we got past the ownership
-	// check rather than being refused.
-	err := clientFor(t, ts).ReleaseRefLock(context.Background(), "refs/heads/main")
-	if err != nil && strings.Contains(err.Error(), "does not hold it") {
-		t.Fatalf("releasing an expired lock should not be refused on ownership grounds: %v", err)
+	if err := clientFor(t, ts).ReleaseRefLock(context.Background(), "refs/heads/main"); err != nil {
+		t.Fatalf("releasing an expired lock should be a no-op, got: %v", err)
 	}
 }
 

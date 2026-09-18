@@ -3,7 +3,6 @@ package oci
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"strings"
 )
 
@@ -13,9 +12,11 @@ import (
 // refs/heads/ and refs/tags/.
 //
 // EncodeRefTag maps a ref name to a tag *injectively*, so that distinct refs
-// can never end up sharing - and therefore overwriting - one manifest. The
-// previous scheme replaced every illegal character with "-" and dropped the
-// refs/heads/ and refs/tags/ prefixes, which silently collided:
+// can never end up sharing - and therefore overwriting - one manifest. The one
+// qualified exception is the truncated form for over-long refs (nsTruncated
+// below, FORMAT.md §3.1), which is collision-resistant rather than injective by
+// construction. The previous scheme replaced every illegal character with "-"
+// and dropped the refs/heads/ and refs/tags/ prefixes, which silently collided:
 //
 //	refs/heads/feature/foo  and  refs/heads/feature-foo   -> "feature-foo"
 //	refs/heads/v1           and  refs/tags/v1             -> "v1"
@@ -40,13 +41,19 @@ const (
 	nsOther = "_x_"
 	// nsTruncated marks a tag whose ref name did not fit and was shortened.
 	//
-	// It must be reserved rather than reusing the plain form: a truncated tag
-	// ends in "-<digest>", which is also perfectly ordinary content, so without
-	// a marker a truncated long ref and a genuinely short ref spelled the same
-	// way as the truncation would produce the identical tag - defeating the
-	// injectivity this encoding exists for. escape() can never emit "_h",
-	// because a lone "_" is always followed by "_" or two hex digits and "h" is
-	// not hex, so this prefix is unambiguous.
+	// The truncated form is lossy and is the one place the mapping is not
+	// injective by construction: two distinct long refs receive distinct tags
+	// unless the first 32 bits of their SHA-256 digests collide, which is
+	// collision-resistant -- unique in practice -- rather than guaranteed
+	// (FORMAT.md §3.1).
+	//
+	// The marker must be reserved rather than reusing the plain form: a
+	// truncated tag ends in "-<digest>", which is also perfectly ordinary
+	// content, so without a marker a truncated long ref and a genuinely short
+	// ref spelled the same way as the truncation would produce the identical
+	// tag - a collision by construction, not by chance. escape() can never
+	// emit "_h", because a lone "_" is always followed by "_" or two hex
+	// digits and "h" is not hex, so this prefix is unambiguous.
 	nsTruncated = "_h_"
 
 	// maxTagLength is the OCI limit: one leading character plus 127 more.
@@ -58,6 +65,19 @@ const (
 // EncodeRefTag returns the OCI tag that stores the manifest for refName.
 // It returns "" if refName is empty.
 func EncodeRefTag(refName string) string {
+	return encodeRefTagWithin(refName, maxTagLength)
+}
+
+// encodeRefTagWithin is EncodeRefTag with the length budget as a parameter.
+//
+// The budget exists for the one caller that cannot use the whole tag: a lock
+// tag is the encoded ref behind LockTagPrefix, and a ref encoded to the full
+// 128 bytes leaves no room for the prefix, so the lock tag exceeded the limit
+// and the registry refused it — which made any ref with a long enough name
+// impossible to push, since the push takes the lock first. Truncating at a
+// smaller budget keeps the same scheme -- injective below the budget,
+// collision-resistant above it -- just applied earlier.
+func encodeRefTagWithin(refName string, budget int) string {
 	if refName == "" {
 		return ""
 	}
@@ -80,47 +100,16 @@ func EncodeRefTag(refName string) string {
 		return ""
 	}
 
-	if len(encoded) <= maxTagLength {
+	if len(encoded) <= budget {
 		return encoded
 	}
 
 	// Too long for a tag. Mark it truncated, keep a readable prefix, and append
-	// a digest of the full ref name so distinct long refs stay distinct.
-	keep := truncateEscaped(encoded, maxTagLength-len(nsTruncated)-truncationSuffixLength)
+	// a digest of the full ref name so distinct long refs stay distinct in
+	// practice; see nsTruncated for why this is not a guarantee.
+	keep := truncateEscaped(encoded, budget-len(nsTruncated)-truncationSuffixLength)
 	sum := sha256.Sum256([]byte(refName))
 	return nsTruncated + keep + "-" + hex.EncodeToString(sum[:])[:8]
-}
-
-// decodeRefTag is the inverse of EncodeRefTag for tags that were not truncated.
-// It returns an error for tags that are not valid output of EncodeRefTag, and
-// for truncated tags, whose original ref name is not recoverable.
-func decodeRefTag(tag string) (string, error) {
-	switch {
-	case tag == "":
-		return "", fmt.Errorf("empty tag")
-	case strings.HasPrefix(tag, nsTruncated):
-		return "", fmt.Errorf("tag %q was truncated; the original ref name is not recoverable", tag)
-	case strings.HasPrefix(tag, nsTag):
-		name, err := unescapeTag(strings.TrimPrefix(tag, nsTag))
-		if err != nil {
-			return "", err
-		}
-		return "refs/tags/" + name, nil
-	case strings.HasPrefix(tag, nsRef):
-		name, err := unescapeTag(strings.TrimPrefix(tag, nsRef))
-		if err != nil {
-			return "", err
-		}
-		return "refs/" + name, nil
-	case strings.HasPrefix(tag, nsOther):
-		return unescapeTag(strings.TrimPrefix(tag, nsOther))
-	default:
-		name, err := unescapeTag(tag)
-		if err != nil {
-			return "", err
-		}
-		return "refs/heads/" + name, nil
-	}
 }
 
 // escapeTag renders an arbitrary string using only characters legal in an OCI
@@ -148,35 +137,6 @@ func escapeTag(s string) string {
 		return "_" + hex.EncodeToString([]byte{out[0]}) + out[1:]
 	}
 	return out
-}
-
-// unescapeTag reverses escapeTag.
-func unescapeTag(s string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); {
-		c := s[i]
-		if c != '_' {
-			b.WriteByte(c)
-			i++
-			continue
-		}
-		if i+1 < len(s) && s[i+1] == '_' {
-			b.WriteByte('_')
-			i += 2
-			continue
-		}
-		if i+2 >= len(s) {
-			return "", fmt.Errorf("truncated escape sequence at offset %d in %q", i, s)
-		}
-		decoded, err := hex.DecodeString(s[i+1 : i+3])
-		if err != nil {
-			return "", fmt.Errorf("invalid escape sequence at offset %d in %q: %w", i, s, err)
-		}
-		b.WriteByte(decoded[0])
-		i += 3
-	}
-	return b.String(), nil
 }
 
 // truncateEscaped shortens an escaped string to at most limit bytes without
