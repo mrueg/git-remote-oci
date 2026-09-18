@@ -13,11 +13,7 @@ import (
 )
 
 func TestThinPackfileDeduplication(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "git-thin-pack-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	tempDir := t.TempDir()
 
 	goRepo, err := gogit.PlainInit(tempDir, false)
 	if err != nil {
@@ -95,11 +91,7 @@ func TestThinPackfileDeduplication(t *testing.T) {
 	}
 
 	// Verify thin packfile can be unpacked/indexed by ImportPackfile
-	destDir, err := os.MkdirTemp("", "git-thin-pack-import-*")
-	if err != nil {
-		t.Fatalf("Failed to create import temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(destDir) }()
+	destDir := t.TempDir()
 
 	destGoRepo, err := gogit.PlainInit(destDir, false)
 	if err != nil {

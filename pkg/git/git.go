@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/revlist"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 	"github.com/mrueg/git-remote-oci/pkg/lfs"
 )
 
@@ -44,6 +46,105 @@ func (r *Repository) gitDir() (gitDir, workDir string) {
 	return gitDirArg()
 }
 
+// CommonDir reports the directory holding this repository's shared state:
+// the object store, the refs, the shallow file, the LFS cache.
+//
+// For an ordinary repository that is the git directory itself. For a linked
+// worktree it is not: git hands a remote helper GIT_DIR=<repo>/.git/worktrees/
+// <name>, a directory holding only what is per-worktree -- HEAD, index, its own
+// logs -- and a `commondir` file naming the directory everything else lives
+// in. Building paths under GIT_DIR from a linked worktree wrote the shallow
+// boundary and looked for imported packs where git itself never puts them.
+func (r *Repository) CommonDir() string {
+	gitDir, _ := r.gitDir()
+	return resolveCommonDir(gitDir)
+}
+
+// ObjectsDir reports the directory this repository's objects are stored in.
+//
+// GIT_OBJECT_DIRECTORY wins if it is set, for the same reason the package-level
+// ObjectsDir honours it: git itself does, and so does every subprocess this
+// package runs.
+func (r *Repository) ObjectsDir() string {
+	if env := os.Getenv("GIT_OBJECT_DIRECTORY"); env != "" {
+		if abs, err := filepath.Abs(env); err == nil {
+			return abs
+		}
+		return env
+	}
+	return filepath.Join(r.CommonDir(), "objects")
+}
+
+// IsShallow reports whether the repository's history is truncated by a
+// $GIT_DIR/shallow graft.
+//
+// It matters to anything that packs "everything reachable from a tip" out of
+// this repository: `git pack-objects --revs` stops at the shallow boundary
+// without a word, so a pack built here looks complete and is not.
+func (r *Repository) IsShallow() bool {
+	content, err := os.ReadFile(filepath.Join(r.CommonDir(), "shallow"))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(content)) != ""
+}
+
+// IsPartial reports whether the repository is a partial (promisor) clone, one
+// that may be missing objects it expects to fetch lazily on demand.
+//
+// The signs are git's own: a promisor remote in the configuration, the
+// partialClone repository extension, or a promisor pack in the object store.
+// Any of them means a walk over local objects can hit a hole, and a pack
+// built from it can be short.
+func (r *Repository) IsPartial() bool {
+	if cfg, err := r.repo.Config(); err == nil && cfg != nil {
+		if cfg.Raw.Section("extensions").Option("partialclone") != "" {
+			return true
+		}
+		for _, remote := range cfg.Raw.Section("remote").Subsections {
+			if strings.EqualFold(remote.Option("promisor"), "true") {
+				return true
+			}
+		}
+	}
+	promisors, _ := filepath.Glob(filepath.Join(r.ObjectsDir(), "pack", "*.promisor"))
+	return len(promisors) > 0
+}
+
+// resolveCommonDir follows a git directory's `commondir` file, if it has one.
+//
+// The file names the shared directory, relative to the git directory when it
+// is not absolute; that is the rule from gitrepository-layout(5). A git
+// directory without one is its own common directory.
+func resolveCommonDir(gitDir string) string {
+	content, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if err != nil {
+		return gitDir
+	}
+	target := strings.TrimSpace(string(content))
+	if target == "" {
+		return gitDir
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(gitDir, target)
+	}
+	return filepath.Clean(target)
+}
+
+// newStorage builds go-git storage over a git directory, routing the shared
+// state to the common directory when the two differ.
+func newStorage(gitDir string) *filesystem.Storage {
+	fs := osfs.New(gitDir)
+	if commonDir := resolveCommonDir(gitDir); commonDir != gitDir {
+		fs = dotgit.NewRepositoryFilesystem(osfs.New(gitDir), osfs.New(commonDir))
+	}
+	return filesystem.NewStorageWithOptions(
+		fs,
+		cache.NewObjectLRUDefault(),
+		filesystem.Options{LargeObjectThreshold: largeObjectThreshold},
+	)
+}
+
 // OpenRepositoryAt opens a specific git directory rather than discovering one.
 //
 // gc needs this. It builds consolidated packfiles out of a scratch object store
@@ -58,11 +159,7 @@ func OpenRepositoryAt(gitDir string) (*Repository, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve %s: %w", gitDir, err)
 	}
-	st := filesystem.NewStorageWithOptions(
-		osfs.New(abs),
-		cache.NewObjectLRUDefault(),
-		filesystem.Options{LargeObjectThreshold: largeObjectThreshold},
-	)
+	st := newStorage(abs)
 	repo, err := gogit.Open(st, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open the git repository at %s: %w", abs, err)
@@ -90,11 +187,7 @@ func OpenRepository() (*Repository, error) {
 	// options. PlainOpen constructs its storage internally, which is why it
 	// cannot be used here: it gives no way to set largeObjectThreshold.
 	if gitDir, worktreeDir, ok := locateRepository(); ok {
-		st := filesystem.NewStorageWithOptions(
-			osfs.New(gitDir),
-			cache.NewObjectLRUDefault(),
-			filesystem.Options{LargeObjectThreshold: largeObjectThreshold},
-		)
+		st := newStorage(gitDir)
 		var worktree billy.Filesystem
 		if worktreeDir != "" {
 			worktree = osfs.New(worktreeDir)
@@ -150,6 +243,11 @@ func locateRepository() (gitDir, worktreeDir string, ok bool) {
 		if filepath.Base(abs) == ".git" {
 			return abs, filepath.Dir(abs), true
 		}
+		// A linked worktree's git directory lives under <repo>/.git/worktrees/
+		// and is not itself a ".git"; its worktree is named by its gitdir file.
+		if wt, found := linkedWorktreeOf(abs); found {
+			return abs, wt, true
+		}
 		return abs, "", true
 	}
 
@@ -166,8 +264,13 @@ func locateRepository() (gitDir, worktreeDir string, ok bool) {
 				return candidate, dir, true
 			}
 		case err == nil:
-			// A ".git" file points elsewhere (linked worktree, submodule).
-			// Resolving that is go-git's job.
+			// A ".git" file points elsewhere: a linked worktree, or a
+			// submodule. It names the git directory, which is then handled
+			// like any other -- its commondir file, if it has one, says where
+			// the shared state is.
+			if target, found := gitDirFile(candidate); found && isGitDir(target) {
+				return target, dir, true
+			}
 			return "", "", false
 		}
 		if isGitDir(dir) {
@@ -181,10 +284,58 @@ func locateRepository() (gitDir, worktreeDir string, ok bool) {
 	}
 }
 
+// gitDirFile reads a ".git" file, which holds `gitdir: <path>`, and returns the
+// absolute git directory it names.
+func gitDirFile(path string) (string, bool) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	line, _, _ := strings.Cut(string(content), "\n")
+	target, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		return "", false
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	return filepath.Clean(target), true
+}
+
+// linkedWorktreeOf reports the working tree a linked worktree's git directory
+// belongs to, which its `gitdir` file records as the path of the worktree's
+// ".git" file.
+func linkedWorktreeOf(gitDir string) (string, bool) {
+	content, err := os.ReadFile(filepath.Join(gitDir, "gitdir"))
+	if err != nil {
+		return "", false
+	}
+	dotGit := strings.TrimSpace(string(content))
+	if dotGit == "" || filepath.Base(dotGit) != ".git" {
+		return "", false
+	}
+	if !filepath.IsAbs(dotGit) {
+		dotGit = filepath.Join(gitDir, dotGit)
+	}
+	return filepath.Dir(filepath.Clean(dotGit)), true
+}
+
 // isGitDir reports whether path looks like a git directory.
+//
+// A linked worktree's git directory has a HEAD of its own but no objects and
+// no refs: those are in the directory its `commondir` file names, and it is
+// that directory which has to look like a repository.
 func isGitDir(path string) bool {
-	for _, entry := range []string{"HEAD", "objects", "refs"} {
-		if _, err := os.Stat(filepath.Join(path, entry)); err != nil {
+	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
+		return false
+	}
+	common := resolveCommonDir(path)
+	for _, entry := range []string{"objects", "refs"} {
+		if _, err := os.Stat(filepath.Join(common, entry)); err != nil {
 			return false
 		}
 	}
@@ -206,11 +357,24 @@ func (r *Repository) ResolveRef(refName string) (plumbing.Hash, error) {
 	if err != nil {
 		return plumbing.ZeroHash, fmt.Errorf("failed to resolve ref %s: %w", refName, err)
 	}
-	// Check if ref points to an annotated tag and peel to target commit
-	if tagObj, err := r.repo.TagObject(ref.Hash()); err == nil {
-		return tagObj.Target, nil
+	return r.peelTag(ref.Hash()), nil
+}
+
+// peelTag follows annotated tags until it reaches something that is not one.
+//
+// A tag may point at another tag -- `git tag -a v1 v1-rc`, say -- and peeling
+// one level then hands back a tag object where a commit was promised. Bounded
+// so that a store describing a tag cycle cannot spin this forever; git
+// refuses to create one, but the objects came from somewhere.
+func (r *Repository) peelTag(hash plumbing.Hash) plumbing.Hash {
+	for range 32 {
+		tagObj, err := r.repo.TagObject(hash)
+		if err != nil {
+			return hash
+		}
+		hash = tagObj.Target
 	}
-	return ref.Hash(), nil
+	return hash
 }
 
 // GetCommitInfo retrieves metadata for a commit.
@@ -269,11 +433,19 @@ func (r *Repository) createThinPackfile(writer io.Writer, wantHash plumbing.Hash
 		revs.WriteString("^" + have.String() + "\n")
 	}
 
-	cmd := exec.Command("git", "--git-dir="+gitDir, "pack-objects",
+	// git's complaint is the only thing that says *why* a pack could not be
+	// built -- a missing object, a bad revision -- so it is kept, bounded, and
+	// put in the error rather than thrown away.
+	//
+	// context.Background: CreatePackfileTo is called from pkg/helper without a
+	// context and its signature is kept. The process is bounded by the writer
+	// it feeds instead -- a closed pipe ends it.
+	var stderr boundedBuffer
+	cmd := exec.CommandContext(context.Background(), "git", "--git-dir="+gitDir, "pack-objects",
 		"--thin", "--revs", "--stdout", "--delta-base-offset", "--quiet")
 	cmd.Dir = workDir
 	cmd.Stdin = strings.NewReader(revs.String())
-	cmd.Stderr = io.Discard
+	cmd.Stderr = &stderr
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -288,7 +460,10 @@ func (r *Repository) createThinPackfile(writer io.Writer, wantHash plumbing.Hash
 	if copyErr != nil || waitErr != nil {
 		err := copyErr
 		if err == nil {
-			err = waitErr
+			err = fmt.Errorf("git pack-objects failed: %w", waitErr)
+			if msg := stderr.String(); msg != "" {
+				err = fmt.Errorf("%w: %s", err, msg)
+			}
 		}
 		if written > 0 {
 			return fmt.Errorf("%w: %w", errPackWritten, err)
@@ -338,7 +513,12 @@ func (r *Repository) createPackfileWithGoGit(writer io.Writer, wantHash plumbing
 func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 	gitDir, _ := r.gitDir()
 
-	packDir := filepath.Join(gitDir, "objects", "pack")
+	// The object store, not $GIT_DIR/objects: the two differ in a linked
+	// worktree and under GIT_OBJECT_DIRECTORY, and git index-pack writes to the
+	// former in both cases. Looking for the .keep under the latter found
+	// nothing, so no lock line was reported and the .keep was left behind for
+	// good.
+	packDir := filepath.Join(r.ObjectsDir(), "pack")
 	if mkErr := os.MkdirAll(packDir, 0755); mkErr != nil {
 		return "", fmt.Errorf("failed to create pack directory %s: %w", packDir, mkErr)
 	}
@@ -348,7 +528,12 @@ func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 	// below needs a second pass over the same bytes, so the stream has to be
 	// replayable regardless. The spool sits beside the object store, which is
 	// where the pack is headed anyway and is real disk rather than a tmpfs.
-	spool, err := os.CreateTemp(packDir, "git-remote-oci-incoming-*.pack")
+	//
+	// Named tmp_* because that is what git's own temporaries in this directory
+	// are called, and what `git prune` sweeps up: a spool orphaned by a kill
+	// mid-import is then reclaimed by the next maintenance run instead of
+	// sitting there forever.
+	spool, err := os.CreateTemp(packDir, "tmp_git-remote-oci-*")
 	if err != nil {
 		return "", fmt.Errorf("failed to stage the incoming packfile: %w", err)
 	}
@@ -375,13 +560,27 @@ func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 	}
 
 	// 1. Try native 'git index-pack --fix-thin --keep=git-remote-oci --stdin' via stdin
-	cmd := exec.Command("git", "--git-dir="+gitDir, "index-pack", "--fix-thin", "--keep=git-remote-oci", "--stdin")
+	//
+	// stdout carries the answer -- `pack\t<sha>` or `keep\t<sha>` -- and stderr
+	// carries whatever git wants to say about it. Reading the two together put
+	// a warning ahead of the answer and the parse below then found no id,
+	// which reported no lock and leaked the .keep. They are kept apart, and
+	// stderr is only ever quoted in an error.
+	//
+	// context.Background: ImportPackfile is called from pkg/helper without a
+	// context and its signature is kept. Both subprocesses read a spool that
+	// is already complete, so there is nothing upstream to cancel them from.
+	ctx := context.Background()
+	var out, indexStderr boundedBuffer
+	cmd := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "index-pack", "--fix-thin", "--keep=git-remote-oci", "--stdin")
 	cmd.Dir = filepath.Dir(gitDir)
 	cmd.Stdin = spool
-	out, indexErr := cmd.CombinedOutput()
+	cmd.Stdout = &out
+	cmd.Stderr = &indexStderr
+	indexErr := cmd.Run()
 
 	if indexErr == nil {
-		fields := strings.Fields(string(out))
+		fields := strings.Fields(out.String())
 		var sha string
 		if len(fields) >= 2 && (fields[0] == "pack" || fields[0] == "keep") {
 			sha = fields[1]
@@ -403,7 +602,7 @@ func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 	}
 
 	// 2. Fallback to git unpack-objects to unpack loose objects into .git/objects/
-	cmdUnpack := exec.Command("git", "--git-dir="+gitDir, "unpack-objects")
+	cmdUnpack := exec.CommandContext(ctx, "git", "--git-dir="+gitDir, "unpack-objects")
 	cmdUnpack.Dir = filepath.Dir(gitDir)
 	if err := rewind(); err != nil {
 		return "", fmt.Errorf("failed to rewind the staged packfile for the unpack-objects fallback: %w", err)
@@ -413,13 +612,38 @@ func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 	if unpackErr != nil {
 		return "", fmt.Errorf(
 			"failed to import packfile: git index-pack failed (%w: %s) and git unpack-objects failed (%w: %s)",
-			indexErr, strings.TrimSpace(string(out)),
+			indexErr, strings.TrimSpace(indexStderr.String()),
 			unpackErr, strings.TrimSpace(string(outUnpack)),
 		)
 	}
 
 	// unpack-objects writes loose objects; there is no pack to keep.
 	return "", nil
+}
+
+// boundedBuffer keeps the first boundedBufferLimit bytes written to it and
+// drops the rest, which is what a subprocess's stderr wants: enough to quote in
+// an error, never enough to matter if the process is chatty.
+type boundedBuffer struct {
+	buf strings.Builder
+}
+
+const boundedBufferLimit = 8 << 10
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := boundedBufferLimit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		b.buf.Write(p)
+	}
+	// Report the full length so the writer never sees a short write.
+	return n, nil
+}
+
+func (b *boundedBuffer) String() string {
+	return strings.TrimSpace(b.buf.String())
 }
 
 // gitDirArg resolves the repository the git subprocesses should address.
@@ -473,6 +697,19 @@ func GitDir() (string, bool) {
 	return guess, false
 }
 
+// CommonDir reports the absolute path of the directory holding the
+// repository's shared state, which is what `git rev-parse --git-common-dir`
+// answers: the git directory itself, or for a linked worktree the directory
+// its `commondir` file names.
+//
+// Everything that is not per-worktree lives here -- objects, refs, the shallow
+// file, the LFS object cache -- so this, not GitDir, is what a path to any of
+// them has to be built on. ok has the same meaning as GitDir's.
+func CommonDir() (string, bool) {
+	gitDir, ok := GitDir()
+	return resolveCommonDir(gitDir), ok
+}
+
 // ObjectsDir reports the absolute path of the repository's object store, which
 // is what `git rev-parse --git-path objects` answers.
 //
@@ -485,11 +722,11 @@ func ObjectsDir() (string, bool) {
 		}
 		return env, true
 	}
-	gitDir, ok := GitDir()
+	commonDir, ok := CommonDir()
 	if !ok {
 		return "", false
 	}
-	return filepath.Join(gitDir, "objects"), true
+	return filepath.Join(commonDir, "objects"), true
 }
 
 // OpenObjectStore opens a directory laid out like a git directory — one holding
@@ -791,20 +1028,33 @@ const lfsPointerMaxSize = 1024
 // Working from the pack's own object list makes the two consistent by
 // construction: every blob that ships is considered, and nothing else is.
 func (r *Repository) ScanLFSPointers(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]*lfs.Pointer, error) {
-	peeledHash := wantHash
-	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
-		peeledHash = tagObj.Target
-	}
-	wants := []plumbing.Hash{peeledHash}
-	if peeledHash != wantHash {
-		wants = append(wants, wantHash)
-	}
-
-	hashes, err := revlist.Objects(r.storer, wants, haveHashes)
+	hashes, err := r.RevList(wantHash, haveHashes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate revlist for LFS scan: %w", err)
 	}
+	return r.ScanLFSPointersIn(hashes)
+}
 
+// RevList lists every object reachable from wantHash and not from haveHashes:
+// the object set a packfile cut for that range carries.
+//
+// ScanLFSPointers, PackedObjects and the go-git packing fallback all want this
+// same list, and each used to walk the repository again to get it. The walk is
+// the expensive part of all three -- it touches every tree in the range -- so a
+// caller pushing one ref computes it once here and hands it to the *In / *Of
+// variants below.
+func (r *Repository) RevList(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]plumbing.Hash, error) {
+	peeled := r.peelTag(wantHash)
+	wants := []plumbing.Hash{peeled}
+	if peeled != wantHash {
+		wants = append(wants, wantHash)
+	}
+	return revlist.Objects(r.storer, wants, haveHashes)
+}
+
+// ScanLFSPointersIn is ScanLFSPointers over an object list already computed by
+// RevList.
+func (r *Repository) ScanLFSPointersIn(hashes []plumbing.Hash) ([]*lfs.Pointer, error) {
 	var pointers []*lfs.Pointer
 	seenOIDs := make(map[string]bool)
 
@@ -851,17 +1101,34 @@ func (r *Repository) GetReachableTags(pushedHashes []plumbing.Hash) ([]TagInfo, 
 		return nil, nil
 	}
 
-	// 1. Collect all objects reachable from pushedHashes
-	reachableObjects, err := revlist.Objects(r.storer, pushedHashes, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute reachable objects: %w", err)
-	}
-
-	reachableSet := make(map[plumbing.Hash]bool, len(reachableObjects)+len(pushedHashes))
+	// 1. Collect the commits reachable from pushedHashes.
+	//
+	// Commits only. A tag points at a commit, so that is the set the question
+	// is about; walking every tree and blob as well -- which is what a revlist
+	// does -- visited the whole repository's contents to answer a question
+	// about its history, on every push.
+	reachableSet := make(map[plumbing.Hash]bool, len(pushedHashes))
 	for _, h := range pushedHashes {
-		reachableSet[h] = true
-	}
-	for _, h := range reachableObjects {
+		commit, err := r.repo.CommitObject(r.peelTag(h))
+		if err != nil {
+			// A tag object, a tree, or something not in the store: nothing
+			// with parents to walk.
+			reachableSet[h] = true
+			continue
+		}
+		// The set doubles as the walker's "already seen" list, so a commit
+		// reached from an earlier tip is not walked again from a later one.
+		// It is filled by the callback rather than up front because the
+		// walker skips a start it has already been told about.
+		iter := object.NewCommitPreorderIter(commit, reachableSet, nil)
+		err = iter.ForEach(func(c *object.Commit) error {
+			reachableSet[c.Hash] = true
+			return nil
+		})
+		iter.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to walk the history of %s: %w", h, err)
+		}
 		reachableSet[h] = true
 	}
 
@@ -956,20 +1223,16 @@ func (r *Repository) GetAnnotatedTagInfo(refName string) (*AnnotatedTagInfo, err
 // thin: it is written to a stream this process does not keep, and indexing it
 // standalone is not possible when its delta bases are deliberately absent.
 func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]PackedObject, error) {
-	peeled := wantHash
-	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
-		peeled = tagObj.Target
-	}
-	wants := []plumbing.Hash{peeled}
-	if peeled != wantHash {
-		wants = append(wants, wantHash)
-	}
-
-	hashes, err := revlist.Objects(r.storer, wants, haveHashes)
+	hashes, err := r.RevList(wantHash, haveHashes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list the objects for %s: %w", wantHash, err)
 	}
+	return r.PackedObjectsOf(hashes), nil
+}
 
+// PackedObjectsOf is PackedObjects over an object list already computed by
+// RevList.
+func (r *Repository) PackedObjectsOf(hashes []plumbing.Hash) []PackedObject {
 	out := make([]PackedObject, 0, len(hashes))
 	for _, h := range hashes {
 		entry := PackedObject{OID: h.String()}
@@ -986,7 +1249,7 @@ func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing
 	// Sorted so a reader can binary-search it, which is the only reason to
 	// publish it rather than let the reader work it out.
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
-	return out, nil
+	return out
 }
 
 // PackedObject is one object in a packfile: its id and its uncompressed size.
