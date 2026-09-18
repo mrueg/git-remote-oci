@@ -1,6 +1,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,28 +25,28 @@ import (
 // such a repository at all: the object-format capability, and the
 // ":object-format sha256" keyword that list emits when git asks for it.
 func TestSHA256RepositoryE2E(t *testing.T) {
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	if err := exec.CommandContext(t.Context(), "docker", "info").Run(); err != nil {
 		t.Skip("Skipping SHA-256 E2E test: Docker is not running")
 	}
 
 	binDir := t.TempDir()
 	binaryPath := filepath.Join(binDir, "git-remote-oci")
-	if out, err := exec.Command("go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(t.Context(), "go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci").CombinedOutput(); err != nil {
 		t.Fatalf("failed to build git-remote-oci: %v\n%s", err, out)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("OCI_INSECURE", "1")
 
 	name := fmt.Sprintf("git-remote-oci-sha256-%d", time.Now().UnixNano())
-	out, err := exec.Command("docker", registryRunArgs(name)...).CombinedOutput()
+	out, err := exec.CommandContext(t.Context(), "docker", registryRunArgs(name)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to start registry: %v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	id := strings.TrimSpace(lines[len(lines)-1])
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
+	t.Cleanup(func() { _ = exec.CommandContext(context.Background(), "docker", "rm", "-f", id).Run() })
 
-	portOut, err := exec.Command("docker", "port", id, "5000").CombinedOutput()
+	portOut, err := exec.CommandContext(t.Context(), "docker", "port", id, "5000").CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to read the container port: %v\n%s", err, portOut)
 	}
@@ -53,8 +54,12 @@ func TestSHA256RepositoryE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to parse the port from %q: %v", portOut, err)
 	}
+	readyReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("http://localhost:%s/v2/", port), nil)
+	if err != nil {
+		t.Fatalf("failed to build readiness request: %v", err)
+	}
 	for range 50 {
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/", port))
+		resp, err := http.DefaultClient.Do(readyReq)
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -70,7 +75,7 @@ func TestSHA256RepositoryE2E(t *testing.T) {
 	}
 	run := func(t *testing.T, dir string, args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir, cmd.Env = dir, append(os.Environ(), env...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -125,7 +130,7 @@ func TestSHA256RepositoryE2E(t *testing.T) {
 
 	// fsck must be able to walk a SHA-256 repository too: it validates ids
 	// before using them as tag names.
-	cmd := exec.Command(binaryPath, "fsck", remote)
+	cmd := exec.CommandContext(t.Context(), binaryPath, "fsck", remote)
 	cmd.Env = append(os.Environ(), "OCI_INSECURE=1")
 	if fsckOut, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("fsck rejected a healthy SHA-256 repository: %v\n%s", err, fsckOut)

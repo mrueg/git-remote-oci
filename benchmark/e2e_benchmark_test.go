@@ -44,6 +44,7 @@ func recordResult(res benchmarkResult) {
 }
 
 func printUnifiedBenchmarkReport(t *testing.T) {
+	t.Helper()
 	resultsMu.Lock()
 	defer resultsMu.Unlock()
 
@@ -105,20 +106,16 @@ func findRepoRoot(tb testing.TB) string {
 }
 
 // buildGitRemoteOCI builds the git-remote-oci binary into a temp dir and adds it to PATH.
-func buildGitRemoteOCI(tb testing.TB) (string, func()) {
+func buildGitRemoteOCI(tb testing.TB) {
 	tb.Helper()
 
 	repoRoot := findRepoRoot(tb)
-	tempBinDir, err := os.MkdirTemp("", "git-oci-bench-bin-*")
-	if err != nil {
-		tb.Fatalf("Failed to create temp bin dir: %v", err)
-	}
+	tempBinDir := tb.TempDir()
 
 	binaryPath := filepath.Join(tempBinDir, "git-remote-oci")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci")
+	buildCmd := exec.CommandContext(tb.Context(), "go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci")
 	buildCmd.Dir = repoRoot
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		_ = os.RemoveAll(tempBinDir)
 		tb.Fatalf("Failed to build git-remote-oci binary: %v\nOutput: %s", err, string(out))
 	}
 
@@ -126,10 +123,6 @@ func buildGitRemoteOCI(tb testing.TB) (string, func()) {
 	newPath := tempBinDir + string(os.PathListSeparator) + oldPath
 	tb.Setenv("PATH", newPath)
 	tb.Setenv("OCI_INSECURE", "1")
-
-	return tempBinDir, func() {
-		_ = os.RemoveAll(tempBinDir)
-	}
 }
 
 // benchmarkRegistryImage is the registry the benchmark runs against. It is not
@@ -142,13 +135,13 @@ const benchmarkRegistryImage = "registry:3"
 func startRegistryContainer(tb testing.TB) (string, func()) {
 	tb.Helper()
 
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	if err := exec.CommandContext(tb.Context(), "docker", "info").Run(); err != nil {
 		tb.Skip("Skipping OCI benchmark: Docker is not available")
 	}
 
 	containerName := fmt.Sprintf("git-remote-oci-bench-%d", time.Now().UnixNano())
 	// Match the E2E suite: manifest deletion is off by default.
-	runCmd := exec.Command("docker", "run", "-d", "--name", containerName,
+	runCmd := exec.CommandContext(tb.Context(), "docker", "run", "-d", "--name", containerName,
 		"-p", "0:5000",
 		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
 		benchmarkRegistryImage)
@@ -160,10 +153,10 @@ func startRegistryContainer(tb testing.TB) (string, func()) {
 	containerID := strings.TrimSpace(lines[len(lines)-1])
 
 	cleanup := func() {
-		_ = exec.Command("docker", "rm", "-f", containerID).Run()
+		_ = exec.CommandContext(context.Background(), "docker", "rm", "-f", containerID).Run()
 	}
 
-	portCmd := exec.Command("docker", "port", containerID, "5000")
+	portCmd := exec.CommandContext(tb.Context(), "docker", "port", containerID, "5000")
 	portOut, err := portCmd.CombinedOutput()
 	if err != nil {
 		cleanup()
@@ -177,9 +170,14 @@ func startRegistryContainer(tb testing.TB) (string, func()) {
 		tb.Fatalf("Failed to parse mapped container port from %q: %v", portLine, err)
 	}
 
+	readyReq, err := http.NewRequestWithContext(tb.Context(), http.MethodGet, fmt.Sprintf("http://localhost:%s/v2/", portStr), nil)
+	if err != nil {
+		cleanup()
+		tb.Fatalf("Failed to build readiness request: %v", err)
+	}
 	ready := false
 	for i := 0; i < 50; i++ {
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/", portStr))
+		resp, err := http.DefaultClient.Do(readyReq)
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -227,7 +225,7 @@ func generateLinearRepo(tb testing.TB, dir string, numCommits int) string {
 	tb.Helper()
 
 	runGit := func(args ...string) string {
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(tb.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
 		var outBuf, errBuf bytes.Buffer
@@ -261,7 +259,7 @@ func generateLinearRepo(tb testing.TB, dir string, numCommits int) string {
 		}
 		args = append(args, "-m", fmt.Sprintf("Commit %d", i))
 
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(tb.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
 		var outBuf, errBuf bytes.Buffer
@@ -281,8 +279,7 @@ func generateLinearRepo(tb testing.TB, dir string, numCommits int) string {
 // Benchmark 1: Linear 20k Commits (OCI Remote Helper vs Git HTTP Server)
 // -----------------------------------------------------------------------------
 func TestBenchmarkLinear20k(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
@@ -295,18 +292,14 @@ func TestBenchmarkLinear20k(t *testing.T) {
 	}
 
 	t.Logf("Generating linear benchmark repo with %d commits...", numCommits)
-	srcDir, err := os.MkdirTemp("", "git-bench-src-linear-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	headSHA := generateLinearRepo(t, srcDir, numCommits)
 	t.Logf("Generated %d commits. Head SHA: %s", numCommits, headSHA)
 
 	// 1. OCI Push
 	ociPushStart := time.Now()
-	cmdPushOCI := exec.Command("git", "push", "oci://"+registryURL, "main")
+	cmdPushOCI := exec.CommandContext(t.Context(), "git", "push", "oci://"+registryURL, "main")
 	cmdPushOCI.Dir = srcDir
 	if out, err := cmdPushOCI.CombinedOutput(); err != nil {
 		t.Fatalf("OCI Push failed: %v\nOutput: %s", err, string(out))
@@ -324,14 +317,10 @@ func TestBenchmarkLinear20k(t *testing.T) {
 	})
 
 	// 2. OCI Clone
-	cloneOCIDir, err := os.MkdirTemp("", "git-bench-clone-oci-*")
-	if err != nil {
-		t.Fatalf("Failed to create clone dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(cloneOCIDir) }()
+	cloneOCIDir := t.TempDir()
 
 	ociCloneStart := time.Now()
-	cmdCloneOCI := exec.Command("git", "clone", "oci://"+registryURL, cloneOCIDir)
+	cmdCloneOCI := exec.CommandContext(t.Context(), "git", "clone", "oci://"+registryURL, cloneOCIDir)
 	if out, err := cmdCloneOCI.CombinedOutput(); err != nil {
 		t.Fatalf("OCI Clone failed: %v\nOutput: %s", err, string(out))
 	}
@@ -348,20 +337,16 @@ func TestBenchmarkLinear20k(t *testing.T) {
 	})
 
 	// 3. Git HTTP Push & Clone comparison
-	gitServerDir, err := os.MkdirTemp("", "git-bench-server-*")
-	if err != nil {
-		t.Fatalf("Failed to create server dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(gitServerDir) }()
+	gitServerDir := t.TempDir()
 
 	bareRepoDir := filepath.Join(gitServerDir, "linear.git")
-	cmdBare := exec.Command("git", "init", "--bare", bareRepoDir)
+	cmdBare := exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir)
 	if out, err := cmdBare.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to init bare repo: %v\nOutput: %s", err, string(out))
 	}
-	_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-	_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
-	_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.maxRequestBuffer", "524288000").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.maxRequestBuffer", "524288000").Run()
 
 	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
 	defer cleanupServer()
@@ -369,7 +354,7 @@ func TestBenchmarkLinear20k(t *testing.T) {
 	httpTargetURL := serverURL + "/linear.git"
 
 	httpPushStart := time.Now()
-	cmdPushHTTP := exec.Command("git", "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
+	cmdPushHTTP := exec.CommandContext(t.Context(), "git", "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
 	cmdPushHTTP.Dir = srcDir
 	if out, err := cmdPushHTTP.CombinedOutput(); err != nil {
 		t.Fatalf("Git HTTP Push failed: %v\nOutput: %s", err, string(out))
@@ -386,14 +371,10 @@ func TestBenchmarkLinear20k(t *testing.T) {
 		extraInfo:      fmt.Sprintf("%d commits", numCommits),
 	})
 
-	cloneHTTPDir, err := os.MkdirTemp("", "git-bench-clone-http-*")
-	if err != nil {
-		t.Fatalf("Failed to create clone dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(cloneHTTPDir) }()
+	cloneHTTPDir := t.TempDir()
 
 	httpCloneStart := time.Now()
-	cmdCloneHTTP := exec.Command("git", "clone", httpTargetURL, cloneHTTPDir)
+	cmdCloneHTTP := exec.CommandContext(t.Context(), "git", "clone", httpTargetURL, cloneHTTPDir)
 	if out, err := cmdCloneHTTP.CombinedOutput(); err != nil {
 		t.Fatalf("Git HTTP Clone failed: %v\nOutput: %s", err, string(out))
 	}
@@ -416,34 +397,29 @@ func TestBenchmarkLinear20k(t *testing.T) {
 // Benchmark 2: Incremental Push Overhead (Single Commit Delta)
 // -----------------------------------------------------------------------------
 func TestBenchmarkIncremental1(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 
-	srcDir, err := os.MkdirTemp("", "git-bench-inc-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	baseCommits := 5000
 	headSHA := generateLinearRepo(t, srcDir, baseCommits)
 
 	// Initial push of base repository
-	_ = exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "main").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "main").Run()
 
 	// Add 1 single commit on top
 	if err := os.WriteFile(filepath.Join(srcDir, "delta.txt"), []byte("delta update"), 0644); err != nil {
 		t.Fatalf("Failed to write delta: %v", err)
 	}
-	_ = exec.Command("git", "-C", srcDir, "add", "delta.txt").Run()
-	_ = exec.Command("git", "-C", srcDir, "commit", "-m", "Incremental commit delta").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "add", "delta.txt").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "commit", "-m", "Incremental commit delta").Run()
 
 	// Measure incremental push latency
 	incStart := time.Now()
-	cmdIncPush := exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "main")
+	cmdIncPush := exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "main")
 	if out, err := cmdIncPush.CombinedOutput(); err != nil {
 		t.Fatalf("Incremental push failed: %v\nOutput: %s", err, string(out))
 	}
@@ -461,37 +437,34 @@ func TestBenchmarkIncremental1(t *testing.T) {
 	})
 
 	// Measure Git HTTP Incremental Push
-	gitServerDir, err := os.MkdirTemp("", "git-bench-inc-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "inc.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "inc.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/inc.git"
-		_ = exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "HEAD~1:refs/heads/main").Run()
+	httpTargetURL := serverURL + "/inc.git"
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "HEAD~1:refs/heads/main").Run()
 
-		incHTTPStart := time.Now()
-		cmdIncPushHTTP := exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
-		if out, err := cmdIncPushHTTP.CombinedOutput(); err == nil {
-			incHTTPDur := time.Since(incHTTPStart)
-			recordResult(benchmarkResult{
-				category:       "Incremental",
-				operation:      "Push (1 commit)",
-				target:         "git-http-backend (HTTP)",
-				duration:       incHTTPDur,
-				itemsCount:     1,
-				throughput:     1.0 / incHTTPDur.Seconds(),
-				throughputUnit: "ops/s",
-				extraInfo:      fmt.Sprintf("1 commit on top of %d base commits", baseCommits),
-			})
-		} else {
-			t.Logf("Git HTTP Incremental Push warning: %v\nOutput: %s", err, string(out))
-		}
+	incHTTPStart := time.Now()
+	cmdIncPushHTTP := exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
+	if out, err := cmdIncPushHTTP.CombinedOutput(); err == nil {
+		incHTTPDur := time.Since(incHTTPStart)
+		recordResult(benchmarkResult{
+			category:       "Incremental",
+			operation:      "Push (1 commit)",
+			target:         "git-http-backend (HTTP)",
+			duration:       incHTTPDur,
+			itemsCount:     1,
+			throughput:     1.0 / incHTTPDur.Seconds(),
+			throughputUnit: "ops/s",
+			extraInfo:      fmt.Sprintf("1 commit on top of %d base commits", baseCommits),
+		})
+	} else {
+		t.Logf("Git HTTP Incremental Push warning: %v\nOutput: %s", err, string(out))
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -501,21 +474,16 @@ func TestBenchmarkIncremental1(t *testing.T) {
 // Benchmark 3: Large File Blobs Benchmark (Payload Throughput MB/s)
 // -----------------------------------------------------------------------------
 func TestBenchmarkLargeBlobs(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 
-	srcDir, err := os.MkdirTemp("", "git-bench-large-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
-	_ = exec.Command("git", "-C", srcDir, "init", "-b", "main").Run()
-	_ = exec.Command("git", "-C", srcDir, "config", "user.name", "Bench").Run()
-	_ = exec.Command("git", "-C", srcDir, "config", "user.email", "bench@test.com").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "init", "-b", "main").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "config", "user.name", "Bench").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "config", "user.email", "bench@test.com").Run()
 
 	// Generate 5 x 10MB random binary files = 50MB total payload
 	totalMB := 50
@@ -527,12 +495,12 @@ func TestBenchmarkLargeBlobs(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(srcDir, fmt.Sprintf("large_file_%d.bin", i)), payload, 0644)
 	}
 
-	_ = exec.Command("git", "-C", srcDir, "add", ".").Run()
-	_ = exec.Command("git", "-C", srcDir, "commit", "-m", "Add 50MB binary blobs").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "add", ".").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "commit", "-m", "Add 50MB binary blobs").Run()
 
 	// Measure Push Throughput
 	pushStart := time.Now()
-	cmdPush := exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "main")
+	cmdPush := exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "main")
 	if out, err := cmdPush.CombinedOutput(); err != nil {
 		t.Fatalf("Large blob push failed: %v\nOutput: %s", err, string(out))
 	}
@@ -549,14 +517,10 @@ func TestBenchmarkLargeBlobs(t *testing.T) {
 	})
 
 	// Measure Clone Throughput
-	cloneDir, err := os.MkdirTemp("", "git-bench-large-clone-*")
-	if err != nil {
-		t.Fatalf("Failed to create clone dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(cloneDir) }()
+	cloneDir := t.TempDir()
 
 	cloneStart := time.Now()
-	cmdClone := exec.Command("git", "clone", "oci://"+registryURL, cloneDir)
+	cmdClone := exec.CommandContext(t.Context(), "git", "clone", "oci://"+registryURL, cloneDir)
 	if out, err := cmdClone.CombinedOutput(); err != nil {
 		t.Fatalf("Large blob clone failed: %v\nOutput: %s", err, string(out))
 	}
@@ -574,51 +538,47 @@ func TestBenchmarkLargeBlobs(t *testing.T) {
 	})
 
 	// Measure Git HTTP Push & Clone for Large Blobs
-	gitServerDir, err := os.MkdirTemp("", "git-bench-large-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "large.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "large.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/large.git"
-		httpPushStart := time.Now()
-		cmdPushHTTP := exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
-		if _, err := cmdPushHTTP.CombinedOutput(); err == nil {
-			httpPushDur := time.Since(httpPushStart)
-			recordResult(benchmarkResult{
-				category:       "Large Blobs",
-				operation:      "Push (50MB)",
-				target:         "git-http-backend (HTTP)",
-				duration:       httpPushDur,
-				itemsCount:     totalMB,
-				throughput:     float64(totalMB) / httpPushDur.Seconds(),
-				throughputUnit: "MB/s",
-				extraInfo:      fmt.Sprintf("%d MB payload across %d files", totalMB, numFiles),
-			})
-		}
+	httpTargetURL := serverURL + "/large.git"
+	httpPushStart := time.Now()
+	cmdPushHTTP := exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
+	if _, err := cmdPushHTTP.CombinedOutput(); err == nil {
+		httpPushDur := time.Since(httpPushStart)
+		recordResult(benchmarkResult{
+			category:       "Large Blobs",
+			operation:      "Push (50MB)",
+			target:         "git-http-backend (HTTP)",
+			duration:       httpPushDur,
+			itemsCount:     totalMB,
+			throughput:     float64(totalMB) / httpPushDur.Seconds(),
+			throughputUnit: "MB/s",
+			extraInfo:      fmt.Sprintf("%d MB payload across %d files", totalMB, numFiles),
+		})
+	}
 
-		httpCloneDir, _ := os.MkdirTemp("", "git-bench-large-clone-http-*")
-		defer func() { _ = os.RemoveAll(httpCloneDir) }()
-		httpCloneStart := time.Now()
-		cmdCloneHTTP := exec.Command("git", "clone", httpTargetURL, httpCloneDir)
-		if _, err := cmdCloneHTTP.CombinedOutput(); err == nil {
-			httpCloneDur := time.Since(httpCloneStart)
-			recordResult(benchmarkResult{
-				category:       "Large Blobs",
-				operation:      "Clone (50MB)",
-				target:         "git-http-backend (HTTP)",
-				duration:       httpCloneDur,
-				itemsCount:     totalMB,
-				throughput:     float64(totalMB) / httpCloneDur.Seconds(),
-				throughputUnit: "MB/s",
-				extraInfo:      fmt.Sprintf("%d MB payload across %d files", totalMB, numFiles),
-			})
-		}
+	httpCloneDir := t.TempDir()
+	httpCloneStart := time.Now()
+	cmdCloneHTTP := exec.CommandContext(t.Context(), "git", "clone", httpTargetURL, httpCloneDir)
+	if _, err := cmdCloneHTTP.CombinedOutput(); err == nil {
+		httpCloneDur := time.Since(httpCloneStart)
+		recordResult(benchmarkResult{
+			category:       "Large Blobs",
+			operation:      "Clone (50MB)",
+			target:         "git-http-backend (HTTP)",
+			duration:       httpCloneDur,
+			itemsCount:     totalMB,
+			throughput:     float64(totalMB) / httpCloneDur.Seconds(),
+			throughputUnit: "MB/s",
+			extraInfo:      fmt.Sprintf("%d MB payload across %d files", totalMB, numFiles),
+		})
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -628,17 +588,12 @@ func TestBenchmarkLargeBlobs(t *testing.T) {
 // Benchmark 4: Wide References Benchmark (1,000 Ref Listing & Indexing)
 // -----------------------------------------------------------------------------
 func TestBenchmarkWideRefs1k(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 
-	srcDir, err := os.MkdirTemp("", "git-bench-widerefs-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	_ = generateLinearRepo(t, srcDir, 10)
 
@@ -647,12 +602,12 @@ func TestBenchmarkWideRefs1k(t *testing.T) {
 	t.Logf("Creating %d branches for wide refs benchmark...", refCount)
 	for i := 1; i <= refCount; i++ {
 		branchName := fmt.Sprintf("branch-%04d", i)
-		_ = exec.Command("git", "-C", srcDir, "branch", branchName, "main").Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "branch", branchName, "main").Run()
 	}
 
 	// Push all 1,000 branches to OCI registry
 	pushStart := time.Now()
-	cmdPushAll := exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "--all")
+	cmdPushAll := exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "--all")
 	if out, err := cmdPushAll.CombinedOutput(); err != nil {
 		t.Fatalf("Wide refs push failed: %v\nOutput: %s", err, string(out))
 	}
@@ -670,7 +625,7 @@ func TestBenchmarkWideRefs1k(t *testing.T) {
 
 	// Measure ls-remote listing duration
 	lsStart := time.Now()
-	cmdLs := exec.Command("git", "ls-remote", "oci://"+registryURL)
+	cmdLs := exec.CommandContext(t.Context(), "git", "ls-remote", "oci://"+registryURL)
 	outLs, err := cmdLs.CombinedOutput()
 	if err != nil {
 		t.Fatalf("ls-remote failed: %v\nOutput: %s", err, string(outLs))
@@ -690,50 +645,47 @@ func TestBenchmarkWideRefs1k(t *testing.T) {
 	})
 
 	// Measure Git HTTP Push --all & ls-remote for 1,000 branches
-	gitServerDir, err := os.MkdirTemp("", "git-bench-widerefs-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "wide.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "wide.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/wide.git"
-		httpPushStart := time.Now()
-		cmdPushAllHTTP := exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "--all")
-		if _, err := cmdPushAllHTTP.CombinedOutput(); err == nil {
-			httpPushDur := time.Since(httpPushStart)
-			recordResult(benchmarkResult{
-				category:       "Wide Refs",
-				operation:      "Push (1,000 branches)",
-				target:         "git-http-backend (HTTP)",
-				duration:       httpPushDur,
-				itemsCount:     refCount,
-				throughput:     float64(refCount) / httpPushDur.Seconds(),
-				throughputUnit: "refs/s",
-				extraInfo:      fmt.Sprintf("%d branch refs push", refCount),
-			})
-		}
+	httpTargetURL := serverURL + "/wide.git"
+	httpPushStart := time.Now()
+	cmdPushAllHTTP := exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "--all")
+	if _, err := cmdPushAllHTTP.CombinedOutput(); err == nil {
+		httpPushDur := time.Since(httpPushStart)
+		recordResult(benchmarkResult{
+			category:       "Wide Refs",
+			operation:      "Push (1,000 branches)",
+			target:         "git-http-backend (HTTP)",
+			duration:       httpPushDur,
+			itemsCount:     refCount,
+			throughput:     float64(refCount) / httpPushDur.Seconds(),
+			throughputUnit: "refs/s",
+			extraInfo:      fmt.Sprintf("%d branch refs push", refCount),
+		})
+	}
 
-		httpLsStart := time.Now()
-		cmdLsHTTP := exec.Command("git", "ls-remote", httpTargetURL)
-		if outLsHTTP, err := cmdLsHTTP.CombinedOutput(); err == nil {
-			httpLsDur := time.Since(httpLsStart)
-			linesHTTP := strings.Split(strings.TrimSpace(string(outLsHTTP)), "\n")
-			recordResult(benchmarkResult{
-				category:       "Wide Refs",
-				operation:      "ls-remote Listing",
-				target:         "git-http-backend (HTTP)",
-				duration:       httpLsDur,
-				itemsCount:     len(linesHTTP),
-				throughput:     float64(len(linesHTTP)) / httpLsDur.Seconds(),
-				throughputUnit: "refs/s",
-				extraInfo:      fmt.Sprintf("Fetched %d ref listing entries via HTTP Smart Protocol", len(linesHTTP)),
-			})
-		}
+	httpLsStart := time.Now()
+	cmdLsHTTP := exec.CommandContext(t.Context(), "git", "ls-remote", httpTargetURL)
+	if outLsHTTP, err := cmdLsHTTP.CombinedOutput(); err == nil {
+		httpLsDur := time.Since(httpLsStart)
+		linesHTTP := strings.Split(strings.TrimSpace(string(outLsHTTP)), "\n")
+		recordResult(benchmarkResult{
+			category:       "Wide Refs",
+			operation:      "ls-remote Listing",
+			target:         "git-http-backend (HTTP)",
+			duration:       httpLsDur,
+			itemsCount:     len(linesHTTP),
+			throughput:     float64(len(linesHTTP)) / httpLsDur.Seconds(),
+			throughputUnit: "refs/s",
+			extraInfo:      fmt.Sprintf("Fetched %d ref listing entries via HTTP Smart Protocol", len(linesHTTP)),
+		})
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -743,42 +695,37 @@ func TestBenchmarkWideRefs1k(t *testing.T) {
 // Benchmark 5: Branchy Graph Topology Benchmark (5,000 Commits + 500 Merges)
 // -----------------------------------------------------------------------------
 func TestBenchmarkBranchyGraph(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 
-	srcDir, err := os.MkdirTemp("", "git-bench-branchy-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
-	_ = exec.Command("git", "-C", srcDir, "init", "-b", "main").Run()
-	_ = exec.Command("git", "-C", srcDir, "config", "user.name", "Bench").Run()
-	_ = exec.Command("git", "-C", srcDir, "config", "user.email", "bench@test.com").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "init", "-b", "main").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "config", "user.name", "Bench").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "config", "user.email", "bench@test.com").Run()
 
 	_ = os.WriteFile(filepath.Join(srcDir, "base.txt"), []byte("initial"), 0644)
-	_ = exec.Command("git", "-C", srcDir, "add", ".").Run()
-	_ = exec.Command("git", "-C", srcDir, "commit", "-m", "initial").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "add", ".").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "commit", "-m", "initial").Run()
 
 	// Generate 500 merge commits across feature branches
 	mergesCount := 500
 	t.Logf("Generating branchy merge graph with %d merges...", mergesCount)
 	for i := 1; i <= mergesCount; i++ {
 		branchName := fmt.Sprintf("feature-%d", i)
-		_ = exec.Command("git", "-C", srcDir, "checkout", "-b", branchName, "main").Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "checkout", "-b", branchName, "main").Run()
 		_ = os.WriteFile(filepath.Join(srcDir, fmt.Sprintf("feat_%d.txt", i)), []byte(fmt.Sprintf("feature %d", i)), 0644)
-		_ = exec.Command("git", "-C", srcDir, "add", ".").Run()
-		_ = exec.Command("git", "-C", srcDir, "commit", "-m", fmt.Sprintf("Feature %d", i)).Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "add", ".").Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "commit", "-m", fmt.Sprintf("Feature %d", i)).Run()
 
-		_ = exec.Command("git", "-C", srcDir, "checkout", "main").Run()
-		_ = exec.Command("git", "-C", srcDir, "merge", "--no-ff", branchName, "-m", fmt.Sprintf("Merge %s", branchName)).Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "checkout", "main").Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "merge", "--no-ff", branchName, "-m", fmt.Sprintf("Merge %s", branchName)).Run()
 	}
 
 	pushStart := time.Now()
-	cmdPush := exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "main")
+	cmdPush := exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "main")
 	if out, err := cmdPush.CombinedOutput(); err != nil {
 		t.Fatalf("Branchy graph push failed: %v\nOutput: %s", err, string(out))
 	}
@@ -796,33 +743,30 @@ func TestBenchmarkBranchyGraph(t *testing.T) {
 	})
 
 	// Measure Git HTTP Push for Branchy Graph
-	gitServerDir, err := os.MkdirTemp("", "git-bench-branchy-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "branchy.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "branchy.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/branchy.git"
-		httpPushStart := time.Now()
-		cmdPushHTTP := exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
-		if _, err := cmdPushHTTP.CombinedOutput(); err == nil {
-			httpPushDur := time.Since(httpPushStart)
-			recordResult(benchmarkResult{
-				category:       "Branchy Graph",
-				operation:      "Push",
-				target:         "git-http-backend (HTTP)",
-				duration:       httpPushDur,
-				itemsCount:     mergesCount * 2,
-				throughput:     float64(mergesCount*2) / httpPushDur.Seconds(),
-				throughputUnit: "commits/s",
-				extraInfo:      fmt.Sprintf("%d feature branch merge graph commits", mergesCount*2),
-			})
-		}
+	httpTargetURL := serverURL + "/branchy.git"
+	httpPushStart := time.Now()
+	cmdPushHTTP := exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main")
+	if _, err := cmdPushHTTP.CombinedOutput(); err == nil {
+		httpPushDur := time.Since(httpPushStart)
+		recordResult(benchmarkResult{
+			category:       "Branchy Graph",
+			operation:      "Push",
+			target:         "git-http-backend (HTTP)",
+			duration:       httpPushDur,
+			itemsCount:     mergesCount * 2,
+			throughput:     float64(mergesCount*2) / httpPushDur.Seconds(),
+			throughputUnit: "commits/s",
+			extraInfo:      fmt.Sprintf("%d feature branch merge graph commits", mergesCount*2),
+		})
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -832,8 +776,7 @@ func TestBenchmarkBranchyGraph(t *testing.T) {
 // Benchmark 6: Parallel Concurrent Clients (10 Concurrent Worker Threads)
 // -----------------------------------------------------------------------------
 func TestBenchmarkParallelClients(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
@@ -850,15 +793,11 @@ func TestBenchmarkParallelClients(t *testing.T) {
 	workers := make([]*workerState, numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		id := i + 1
-		wDir, err := os.MkdirTemp("", fmt.Sprintf("git-bench-worker-%d-*", id))
-		if err != nil {
-			t.Fatalf("Failed to create worker temp dir: %v", err)
-		}
-		defer func(d string) { _ = os.RemoveAll(d) }(wDir)
+		wDir := t.TempDir()
 
 		_ = generateLinearRepo(t, wDir, 25)
 		branchName := fmt.Sprintf("worker-branch-%d", id)
-		_ = exec.Command("git", "-C", wDir, "branch", "-m", "main", branchName).Run()
+		_ = exec.CommandContext(t.Context(), "git", "-C", wDir, "branch", "-m", "main", branchName).Run()
 		workers[i] = &workerState{id: id, dir: wDir, branchName: branchName}
 	}
 
@@ -920,72 +859,64 @@ func TestBenchmarkParallelClients(t *testing.T) {
 	})
 
 	// Measure Git HTTP Parallel Push & Fetch
-	gitServerDir, err := os.MkdirTemp("", "git-bench-parallel-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "parallel.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "parallel.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/parallel.git"
-		var wgHTTP sync.WaitGroup
-		errsHTTP := make(chan error, numWorkers)
-		startHTTPAll := time.Now()
+	httpTargetURL := serverURL + "/parallel.git"
+	var wgHTTP sync.WaitGroup
+	errsHTTP := make(chan error, numWorkers)
+	startHTTPAll := time.Now()
 
-		for workerID := 1; workerID <= numWorkers; workerID++ {
-			wgHTTP.Add(1)
-			go func(id int) {
-				defer wgHTTP.Done()
-				wDir, err := os.MkdirTemp("", fmt.Sprintf("git-bench-worker-http-%d-*", id))
-				if err != nil {
-					errsHTTP <- err
-					return
-				}
-				defer func() { _ = os.RemoveAll(wDir) }()
+	for workerID := 1; workerID <= numWorkers; workerID++ {
+		wgHTTP.Add(1)
+		go func(id int) {
+			defer wgHTTP.Done()
+			wDir := t.TempDir()
 
-				_ = generateLinearRepo(t, wDir, 25)
-				branchName := fmt.Sprintf("worker-branch-%d", id)
-				_ = exec.Command("git", "-C", wDir, "branch", "-m", "main", branchName).Run()
+			_ = generateLinearRepo(t, wDir, 25)
+			branchName := fmt.Sprintf("worker-branch-%d", id)
+			_ = exec.CommandContext(t.Context(), "git", "-C", wDir, "branch", "-m", "main", branchName).Run()
 
-				cmdPushHTTP := exec.Command("git", "-C", wDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, branchName)
-				if out, err := cmdPushHTTP.CombinedOutput(); err != nil {
-					errsHTTP <- fmt.Errorf("Worker %d HTTP push failed: %v\nOutput: %s", id, err, string(out))
-					return
-				}
-
-				cmdFetchHTTP := exec.Command("git", "-C", wDir, "fetch", httpTargetURL, branchName)
-				if out, err := cmdFetchHTTP.CombinedOutput(); err != nil {
-					errsHTTP <- fmt.Errorf("Worker %d HTTP fetch failed: %v\nOutput: %s", id, err, string(out))
-					return
-				}
-			}(workerID)
-		}
-
-		wgHTTP.Wait()
-		close(errsHTTP)
-		hasHTTPWorkerErr := false
-		for err := range errsHTTP {
-			if err != nil {
-				hasHTTPWorkerErr = true
+			cmdPushHTTP := exec.CommandContext(t.Context(), "git", "-C", wDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, branchName)
+			if out, err := cmdPushHTTP.CombinedOutput(); err != nil {
+				errsHTTP <- fmt.Errorf("Worker %d HTTP push failed: %v\nOutput: %s", id, err, string(out))
+				return
 			}
+
+			cmdFetchHTTP := exec.CommandContext(t.Context(), "git", "-C", wDir, "fetch", httpTargetURL, branchName)
+			if out, err := cmdFetchHTTP.CombinedOutput(); err != nil {
+				errsHTTP <- fmt.Errorf("Worker %d HTTP fetch failed: %v\nOutput: %s", id, err, string(out))
+				return
+			}
+		}(workerID)
+	}
+
+	wgHTTP.Wait()
+	close(errsHTTP)
+	hasHTTPWorkerErr := false
+	for err := range errsHTTP {
+		if err != nil {
+			hasHTTPWorkerErr = true
 		}
-		if !hasHTTPWorkerErr {
-			totalHTTPDur := time.Since(startHTTPAll)
-			recordResult(benchmarkResult{
-				category:       "Concurrency",
-				operation:      "Parallel Push/Fetch",
-				target:         "git-http-backend (HTTP)",
-				duration:       totalHTTPDur,
-				itemsCount:     numWorkers * 100,
-				throughput:     float64(numWorkers*100) / totalHTTPDur.Seconds(),
-				throughputUnit: "commits/s",
-				extraInfo:      fmt.Sprintf("%d parallel workers, 100 commits each", numWorkers),
-			})
-		}
+	}
+	if !hasHTTPWorkerErr {
+		totalHTTPDur := time.Since(startHTTPAll)
+		recordResult(benchmarkResult{
+			category:       "Concurrency",
+			operation:      "Parallel Push/Fetch",
+			target:         "git-http-backend (HTTP)",
+			duration:       totalHTTPDur,
+			itemsCount:     numWorkers * 100,
+			throughput:     float64(numWorkers*100) / totalHTTPDur.Seconds(),
+			throughputUnit: "commits/s",
+			extraInfo:      fmt.Sprintf("%d parallel workers, 100 commits each", numWorkers),
+		})
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -995,30 +926,24 @@ func TestBenchmarkParallelClients(t *testing.T) {
 // Benchmark 7: Shallow Clone Throughput (--depth 1 vs --depth 50 vs Full)
 // -----------------------------------------------------------------------------
 func TestBenchmarkShallowClone(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 
-	srcDir, err := os.MkdirTemp("", "git-bench-shallow-src-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	totalCommits := 3000
 	_ = generateLinearRepo(t, srcDir, totalCommits)
 
 	// Push 3,000 commits
-	_ = exec.Command("git", "-C", srcDir, "push", "oci://"+registryURL, "main").Run()
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "push", "oci://"+registryURL, "main").Run()
 
 	// 1. Shallow Clone depth 1
-	shallow1Dir, _ := os.MkdirTemp("", "git-bench-shallow1-*")
-	defer func() { _ = os.RemoveAll(shallow1Dir) }()
+	shallow1Dir := t.TempDir()
 
 	depth1Start := time.Now()
-	cmdD1 := exec.Command("git", "clone", "--depth", "1", "oci://"+registryURL, shallow1Dir)
+	cmdD1 := exec.CommandContext(t.Context(), "git", "clone", "--depth", "1", "oci://"+registryURL, shallow1Dir)
 	if out, err := cmdD1.CombinedOutput(); err != nil {
 		t.Fatalf("Shallow clone --depth 1 failed: %v\nOutput: %s", err, string(out))
 	}
@@ -1036,11 +961,10 @@ func TestBenchmarkShallowClone(t *testing.T) {
 	})
 
 	// 2. Shallow Clone depth 50
-	shallow50Dir, _ := os.MkdirTemp("", "git-bench-shallow50-*")
-	defer func() { _ = os.RemoveAll(shallow50Dir) }()
+	shallow50Dir := t.TempDir()
 
 	depth50Start := time.Now()
-	cmdD50 := exec.Command("git", "clone", "--depth", "50", "oci://"+registryURL, shallow50Dir)
+	cmdD50 := exec.CommandContext(t.Context(), "git", "clone", "--depth", "50", "oci://"+registryURL, shallow50Dir)
 	if out, err := cmdD50.CombinedOutput(); err != nil {
 		t.Fatalf("Shallow clone --depth 50 failed: %v\nOutput: %s", err, string(out))
 	}
@@ -1058,55 +982,50 @@ func TestBenchmarkShallowClone(t *testing.T) {
 	})
 
 	// Measure Git HTTP Shallow Clone (--depth 1 and --depth 50)
-	gitServerDir, err := os.MkdirTemp("", "git-bench-shallow-server-*")
-	if err == nil {
-		defer func() { _ = os.RemoveAll(gitServerDir) }()
-		bareRepoDir := filepath.Join(gitServerDir, "shallow.git")
-		_ = exec.Command("git", "init", "--bare", bareRepoDir).Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
-		_ = exec.Command("git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
+	gitServerDir := t.TempDir()
+	bareRepoDir := filepath.Join(gitServerDir, "shallow.git")
+	_ = exec.CommandContext(t.Context(), "git", "init", "--bare", bareRepoDir).Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.receivepack", "true").Run()
+	_ = exec.CommandContext(t.Context(), "git", "--git-dir="+bareRepoDir, "config", "http.postBuffer", "524288000").Run()
 
-		serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
-		defer cleanupServer()
+	serverURL, cleanupServer := startGitHTTPServer(t, gitServerDir)
+	defer cleanupServer()
 
-		httpTargetURL := serverURL + "/shallow.git"
-		_ = exec.Command("git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main").Run()
+	httpTargetURL := serverURL + "/shallow.git"
+	_ = exec.CommandContext(t.Context(), "git", "-C", srcDir, "-c", "http.postBuffer=524288000", "push", httpTargetURL, "main").Run()
 
-		httpDepth1Dir, _ := os.MkdirTemp("", "git-bench-shallow1-http-*")
-		defer func() { _ = os.RemoveAll(httpDepth1Dir) }()
-		d1HTTPStart := time.Now()
-		cmdD1HTTP := exec.Command("git", "clone", "--depth", "1", httpTargetURL, httpDepth1Dir)
-		if _, err := cmdD1HTTP.CombinedOutput(); err == nil {
-			d1HTTPDur := time.Since(d1HTTPStart)
-			recordResult(benchmarkResult{
-				category:       "Shallow Clone",
-				operation:      "Clone (--depth 1)",
-				target:         "git-http-backend (HTTP)",
-				duration:       d1HTTPDur,
-				itemsCount:     1,
-				throughput:     1.0 / d1HTTPDur.Seconds(),
-				throughputUnit: "ops/s",
-				extraInfo:      fmt.Sprintf("Truncated from %d total commits to 1 commit", totalCommits),
-			})
-		}
+	httpDepth1Dir := t.TempDir()
+	d1HTTPStart := time.Now()
+	cmdD1HTTP := exec.CommandContext(t.Context(), "git", "clone", "--depth", "1", httpTargetURL, httpDepth1Dir)
+	if _, err := cmdD1HTTP.CombinedOutput(); err == nil {
+		d1HTTPDur := time.Since(d1HTTPStart)
+		recordResult(benchmarkResult{
+			category:       "Shallow Clone",
+			operation:      "Clone (--depth 1)",
+			target:         "git-http-backend (HTTP)",
+			duration:       d1HTTPDur,
+			itemsCount:     1,
+			throughput:     1.0 / d1HTTPDur.Seconds(),
+			throughputUnit: "ops/s",
+			extraInfo:      fmt.Sprintf("Truncated from %d total commits to 1 commit", totalCommits),
+		})
+	}
 
-		httpDepth50Dir, _ := os.MkdirTemp("", "git-bench-shallow50-http-*")
-		defer func() { _ = os.RemoveAll(httpDepth50Dir) }()
-		d50HTTPStart := time.Now()
-		cmdD50HTTP := exec.Command("git", "clone", "--depth", "50", httpTargetURL, httpDepth50Dir)
-		if _, err := cmdD50HTTP.CombinedOutput(); err == nil {
-			d50HTTPDur := time.Since(d50HTTPStart)
-			recordResult(benchmarkResult{
-				category:       "Shallow Clone",
-				operation:      "Clone (--depth 50)",
-				target:         "git-http-backend (HTTP)",
-				duration:       d50HTTPDur,
-				itemsCount:     50,
-				throughput:     50.0 / d50HTTPDur.Seconds(),
-				throughputUnit: "commits/s",
-				extraInfo:      fmt.Sprintf("Truncated from %d total commits to 50 commits", totalCommits),
-			})
-		}
+	httpDepth50Dir := t.TempDir()
+	d50HTTPStart := time.Now()
+	cmdD50HTTP := exec.CommandContext(t.Context(), "git", "clone", "--depth", "50", httpTargetURL, httpDepth50Dir)
+	if _, err := cmdD50HTTP.CombinedOutput(); err == nil {
+		d50HTTPDur := time.Since(d50HTTPStart)
+		recordResult(benchmarkResult{
+			category:       "Shallow Clone",
+			operation:      "Clone (--depth 50)",
+			target:         "git-http-backend (HTTP)",
+			duration:       d50HTTPDur,
+			itemsCount:     50,
+			throughput:     50.0 / d50HTTPDur.Seconds(),
+			throughputUnit: "commits/s",
+			extraInfo:      fmt.Sprintf("Truncated from %d total commits to 50 commits", totalCommits),
+		})
 	}
 
 	printUnifiedBenchmarkReport(t)
@@ -1131,7 +1050,11 @@ func registryStoredBytes(tb testing.TB, repoRef string) int64 {
 	}
 	base := "http://" + host + "/v2/" + name
 
-	resp, err := http.Get(base + "/tags/list")
+	tagsReq, err := http.NewRequestWithContext(tb.Context(), http.MethodGet, base+"/tags/list", nil)
+	if err != nil {
+		tb.Fatalf("list tags: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(tagsReq)
 	if err != nil {
 		tb.Fatalf("list tags: %v", err)
 	}
@@ -1145,7 +1068,7 @@ func registryStoredBytes(tb testing.TB, repoRef string) int64 {
 
 	seen := map[string]int64{}
 	for _, tag := range tagList.Tags {
-		req, err := http.NewRequest(http.MethodGet, base+"/manifests/"+tag, nil)
+		req, err := http.NewRequestWithContext(tb.Context(), http.MethodGet, base+"/manifests/"+tag, nil)
 		if err != nil {
 			continue
 		}
@@ -1220,18 +1143,13 @@ func dirBytes(tb testing.TB, dir string) int64 {
 // The fixture deliberately has both a long history and a substantial tip. A
 // repository with a tiny tip would show the benefit and hide the cost.
 func TestBenchmarkShallowSnapshot(t *testing.T) {
-	_, cleanupBin := buildGitRemoteOCI(t)
-	defer cleanupBin()
+	buildGitRemoteOCI(t)
 
 	registryURL, cleanupDocker := startRegistryContainer(t)
 	defer cleanupDocker()
 	host, _, _ := strings.Cut(registryURL, "/")
 
-	srcDir, err := os.MkdirTemp("", "git-bench-snap-src-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	const (
 		historyCommits = 60
@@ -1239,16 +1157,13 @@ func TestBenchmarkShallowSnapshot(t *testing.T) {
 		fileBytes      = 64 * 1024
 	)
 
-	runGit := func(dir string, args ...string) string {
-		cmd := exec.Command("git", args...)
+	runGit := func(dir string, args ...string) {
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
-		var out, errBuf bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &out, &errBuf
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, errBuf.String())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 		}
-		return strings.TrimSpace(out.String())
 	}
 	writeRandom := func(name string) {
 		payload := make([]byte, fileBytes)
@@ -1341,13 +1256,10 @@ func TestBenchmarkShallowSnapshot(t *testing.T) {
 			{"Clone (--depth 1)", []string{"clone", "--depth", "1"}},
 			{"Clone (full)", []string{"clone"}},
 		} {
-			dst, err := os.MkdirTemp("", "git-bench-snap-clone-*")
-			if err != nil {
-				t.Fatalf("temp dir: %v", err)
-			}
+			dst := t.TempDir()
 
 			start := time.Now()
-			cmd := exec.Command("git", append(append([]string{}, clone.args...), "oci://"+v.repo, dst)...)
+			cmd := exec.CommandContext(t.Context(), "git", append(append([]string{}, clone.args...), "oci://"+v.repo, dst)...)
 			cmd.Env = os.Environ()
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("%s (%s) failed: %v\n%s", clone.label, v.name, err, out)

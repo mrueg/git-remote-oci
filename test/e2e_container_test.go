@@ -22,19 +22,15 @@ import (
 
 func TestRealContainerRegistryE2E(t *testing.T) {
 	// 1. Check if Docker CLI & Daemon are available
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	if err := exec.CommandContext(t.Context(), "docker", "info").Run(); err != nil {
 		t.Skip("Skipping real container E2E test: Docker is not running")
 	}
 
 	// 2. Build git-remote-oci binary
-	tempBinDir, err := os.MkdirTemp("", "git-oci-bin-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp bin dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tempBinDir) }()
+	tempBinDir := t.TempDir()
 
 	binaryPath := filepath.Join(tempBinDir, "git-remote-oci")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci")
+	buildCmd := exec.CommandContext(t.Context(), "go", "build", "-o", binaryPath, "github.com/mrueg/git-remote-oci")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build git-remote-oci binary: %v\nOutput: %s", err, string(out))
 	}
@@ -50,7 +46,7 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	containerName := fmt.Sprintf("git-remote-oci-e2e-%d", time.Now().UnixNano())
 	t.Logf("Starting Docker container %s (%s)...", containerName, registryImage())
 
-	runCmd := exec.Command("docker", registryRunArgs(containerName)...)
+	runCmd := exec.CommandContext(t.Context(), "docker", registryRunArgs(containerName)...)
 	runOut, err := runCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to start %s container: %v\nOutput: %s", registryImage(), err, string(runOut))
@@ -61,11 +57,11 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	// Ensure container is stopped & removed on test completion
 	t.Cleanup(func() {
 		t.Logf("Cleaning up Docker container %s...", containerID)
-		_ = exec.Command("docker", "rm", "-f", containerID).Run()
+		_ = exec.CommandContext(context.Background(), "docker", "rm", "-f", containerID).Run()
 	})
 
 	// Get host port mapped to container port 5000
-	portCmd := exec.Command("docker", "port", containerID, "5000")
+	portCmd := exec.CommandContext(t.Context(), "docker", "port", containerID, "5000")
 	portOut, err := portCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to get container port: %v\nOutput: %s", err, string(portOut))
@@ -82,9 +78,13 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	t.Logf("Container Registry running at %s", registryURL)
 
 	// Poll registry until responsive (up to 5s)
+	readyReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("http://localhost:%s/v2/", portStr), nil)
+	if err != nil {
+		t.Fatalf("Failed to build readiness request: %v", err)
+	}
 	ready := false
 	for i := 0; i < 50; i++ {
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/", portStr))
+		resp, err := http.DefaultClient.Do(readyReq)
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -99,14 +99,10 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	}
 
 	// 4. Create a source Git repository using real git CLI
-	srcDir, err := os.MkdirTemp("", "git-oci-e2e-src-*")
-	if err != nil {
-		t.Fatalf("Failed to create src temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(srcDir) }()
+	srcDir := t.TempDir()
 
 	runGit := func(dir string, args ...string) string {
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
 		var outBuf, errBuf bytes.Buffer
@@ -120,7 +116,7 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	}
 
 	runGitAllowError := func(dir string, args ...string) (string, string, error) {
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		cmd.Env = os.Environ()
 		var outBuf, errBuf bytes.Buffer
@@ -164,11 +160,7 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	runGit(srcDir, "push", "origin", "main", "--tags")
 
 	// 7. Clone repository from OCI registry in a clean directory using real `git clone`!
-	cloneParentDir, err := os.MkdirTemp("", "git-oci-e2e-clone-*")
-	if err != nil {
-		t.Fatalf("Failed to create clone temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(cloneParentDir) }()
+	cloneParentDir := t.TempDir()
 
 	t.Logf("Executing real 'git clone %s'...", ociRemoteURL)
 	clonedRepoDir := filepath.Join(cloneParentDir, "cloned-repo")
@@ -487,7 +479,7 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 
 	tagsBefore := listRegistryTags(t, portStr)
 
-	gcCmd := exec.Command(binaryPath, "gc", ociRemoteURL)
+	gcCmd := exec.CommandContext(t.Context(), binaryPath, "gc", ociRemoteURL)
 	gcCmd.Dir = srcDir
 	gcCmd.Env = append(os.Environ(), "OCI_INSECURE=1")
 	if gcOut, gcErr := gcCmd.CombinedOutput(); gcErr != nil {
@@ -514,7 +506,7 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	t.Log("Testing E2E fsck and break-lock...")
 
 	runBin := func(args ...string) (string, error) {
-		cmd := exec.Command(binaryPath, args...)
+		cmd := exec.CommandContext(t.Context(), binaryPath, args...)
 		cmd.Dir = srcDir
 		// GIT_REMOTE_OCI_SUBCOMMAND says these are deliberate subcommand runs.
 		// A single-URL subcommand has the same argv as git invoking the helper
@@ -651,10 +643,10 @@ func verifyProtocolV2(t *testing.T, runGit func(string, ...string) string, clone
 	t.Helper()
 
 	v2 := []string{"-c", "protocol.version=2", "-c", "ociremote.protocolV2=true"}
-	clone := func(dir string, extra ...string) string {
+	clone := func(dir string, extra ...string) {
 		args := append(append([]string{}, v2...), "clone")
 		args = append(args, extra...)
-		return runGit(cloneParentDir, append(args, ociRemoteURL, dir)...)
+		runGit(cloneParentDir, append(args, ociRemoteURL, dir)...)
 	}
 
 	// A full clone, checked the way git checks: fsck, and the history it holds.
@@ -823,7 +815,11 @@ func verifyAtomicRollback(t *testing.T,
 func listRegistryTags(t *testing.T, port string) []string {
 	t.Helper()
 
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/test-org/test-repo/tags/list", port))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("http://localhost:%s/v2/test-org/test-repo/tags/list", port), nil)
+	if err != nil {
+		t.Fatalf("failed to build the tag list request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("failed to list tags: %v", err)
 	}

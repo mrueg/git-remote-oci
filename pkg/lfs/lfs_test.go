@@ -33,19 +33,14 @@ func TestLFSPointerParsing(t *testing.T) {
 }
 
 func TestLFSStorage(t *testing.T) {
-	tempGitDir, err := os.MkdirTemp("", "git-lfs-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tempGitDir) }()
+	tempGitDir := t.TempDir()
 
 	payload := []byte("Hello, Git LFS OCI payload!")
 	// The OID must be the SHA-256 of the payload; StoreLFSObject verifies it.
 	sum := sha256.Sum256(payload)
 	oid := hex.EncodeToString(sum[:])
 
-	err = lfs.StoreLFSObject(tempGitDir, oid, bytes.NewReader(payload))
-	if err != nil {
+	if err := lfs.StoreLFSObject(tempGitDir, oid, bytes.NewReader(payload)); err != nil {
 		t.Fatalf("StoreLFSObject failed: %v", err)
 	}
 
