@@ -263,10 +263,6 @@ func TestAuthCredHelperWithNoCredentialIsAnonymous(t *testing.T) {
 // them the request "was made anonymously" and to run `docker login` sends them
 // to fix the wrong thing.
 func TestAuthCredHelperFailureIsSurfaced(t *testing.T) {
-	t.Skip("known gap: a credential helper failure is silently downgraded to anonymous access; " +
-		"oci.NewClient's Credential callback discards the store error and falls through to auth.EmptyCredential, " +
-		"so the eventual 401 is explained as an anonymous request. Un-skip once the helper error is surfaced.")
-
 	for _, tc := range []struct {
 		name   string
 		script string

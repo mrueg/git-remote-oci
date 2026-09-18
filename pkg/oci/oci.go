@@ -20,6 +20,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/credentials/trace"
 	"oras.land/oras-go/v2/registry/remote/errcode"
 )
 
@@ -398,8 +399,29 @@ func NewClient(repoRef string, plainHTTP bool) (*Client, error) {
 
 		// 2. Docker credential store (~/.docker/config.json and native credential helpers)
 		if dockerStore != nil {
-			cred, err := credentials.Credential(dockerStore)(ctx, serverAddress)
-			if err == nil && (cred.Username != "" || cred.Password != "" || cred.AccessToken != "" || cred.RefreshToken != "") {
+			// The store names the helper binary it runs only through this
+			// trace, and the error it returns for a helper that broke does
+			// not: an exit status alone would leave the user guessing which
+			// of their configured helpers to look at.
+			var helperName string
+			traced := trace.WithExecutableTrace(ctx, &trace.ExecutableTrace{
+				ExecuteStart: func(executableName, _ string) { helperName = executableName },
+			})
+			cred, err := credentials.Credential(dockerStore)(traced, serverAddress)
+			if err != nil {
+				// A helper that answers "credentials not found" is already
+				// mapped to an empty credential by the store, so an error here
+				// is the store itself failing: the helper exited non-zero,
+				// printed something that is not a credential, or could not be
+				// run at all. That used to fall through to anonymous access,
+				// and the registry's 401 was then explained as a request that
+				// had carried no credentials, sending the user to `docker
+				// login` when what needed fixing was the helper they had
+				// already configured.
+				client.authFrom.Store(originDockerStore)
+				return auth.EmptyCredential, credentialStoreError(helperName, serverAddress, err)
+			}
+			if cred.Username != "" || cred.Password != "" || cred.AccessToken != "" || cred.RefreshToken != "" {
 				client.authFrom.Store(originDockerStore)
 				return cred, nil
 			}

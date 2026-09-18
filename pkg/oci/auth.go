@@ -98,6 +98,22 @@ func (c *Client) explainAuth(err error) error {
 	return fmt.Errorf("%w (the credentials came from %s and were never accepted by this registry; they may be wrong or lack access to this repository)", err, source)
 }
 
+// credentialStoreError describes a Docker credential store that failed to
+// answer, naming the helper binary when one was run.
+//
+// The registry is never asked anonymously in this case: the user configured a
+// credential source and it broke, and the fix is that source, not a login.
+func credentialStoreError(helperName, serverAddress string, err error) error {
+	if helperName != "" {
+		return fmt.Errorf("the Docker credential helper %s failed for %s: %w "+
+			"(the request was not sent; repair or remove the helper in ~/.docker/config.json, "+
+			"or set OCI_USERNAME and OCI_PASSWORD to bypass it)", helperName, serverAddress, err)
+	}
+	return fmt.Errorf("the Docker credential store failed for %s: %w "+
+		"(the request was not sent; check ~/.docker/config.json, "+
+		"or set OCI_USERNAME and OCI_PASSWORD to bypass it)", serverAddress, err)
+}
+
 // noteResponse records whether the registry is accepting this client.
 //
 // Only a 2xx against this repository counts. This used to accept any non-5xx
