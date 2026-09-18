@@ -26,7 +26,7 @@ func repoWith(t *testing.T, entries map[string]string) {
 	dir := t.TempDir()
 	run := func(args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		cmd := exec.CommandContext(t.Context(), "git", args...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -118,18 +118,88 @@ func TestPerRemoteScopeWins(t *testing.T) {
 
 // TestKeyNamesAreCaseInsensitive: git lowercases the section and variable of
 // every name, so the natural camelCase spelling has to reach the same entry.
+//
+// The subsection -- the remote's name -- is not lowercased, by git or here, so
+// the remote is asked for under the name it was configured with. This test
+// used to load "origin" and expect the "Origin" entry, which passed only
+// because the whole name was being folded; see TestRemoteNamesAreCaseSensitive.
 func TestKeyNamesAreCaseInsensitive(t *testing.T) {
 	repoWith(t, map[string]string{
 		"ociRemote.blobConcurrency":    "5",
 		"remote.Origin.ociPushLockTTL": "2m",
 	})
-	c := config.Load("origin")
+	c := config.Load("Origin")
 
 	if got := c.Int(config.KeyBlobConcurrency, 64); got != 5 {
 		t.Errorf("blobconcurrency = %d, want 5", got)
 	}
 	if got := c.Duration(config.KeyPushLockTTL, time.Minute); got != 2*time.Minute {
 		t.Errorf("pushlockttl = %v, want 2m", got)
+	}
+}
+
+// TestRemoteNamesAreCaseSensitive: `remote.Foo` and `remote.foo` are two
+// remotes to git, and `git config --list` reports the subsection as written.
+// Lowercasing the whole name folded them together, so a remote with a capital
+// in its name read settings meant for another.
+func TestRemoteNamesAreCaseSensitive(t *testing.T) {
+	repoWith(t, map[string]string{
+		"remote.Foo.ociConcurrency": "2",
+		"remote.foo.ociConcurrency": "9",
+	})
+
+	if got := config.Load("Foo").Int(config.KeyConcurrency, 12); got != 2 {
+		t.Errorf("Foo concurrency = %d, want 2", got)
+	}
+	if got := config.Load("foo").Int(config.KeyConcurrency, 12); got != 9 {
+		t.Errorf("foo concurrency = %d, want 9", got)
+	}
+	// A remote configured only under one spelling is not found under the
+	// other -- that is a different remote as far as git is concerned.
+	repoWith(t, map[string]string{"remote.Bar.ociConcurrency": "4"})
+	if got := config.Load("bar").Int(config.KeyConcurrency, 12); got != 12 {
+		t.Errorf("bar concurrency = %d, want the default: remote.Bar is a different remote", got)
+	}
+	if got := config.Load("Bar").Int(config.KeyConcurrency, 12); got != 4 {
+		t.Errorf("Bar concurrency = %d, want 4", got)
+	}
+}
+
+// TestCountAcceptsZero is the difference between Count and Int, and the reason
+// Count exists: `ociremote.compactAfter 0` is documented as switching automatic
+// compaction off, and Int read it as "use the default", which switched it on.
+func TestCountAcceptsZero(t *testing.T) {
+	repoWith(t, map[string]string{"ociremote.compactafter": "0"})
+	c := config.Load("origin")
+
+	if got := c.Count(config.KeyCompactAfter, 50); got != 0 {
+		t.Errorf("Count(compactafter=0) = %d, want 0", got)
+	}
+	// And Int still refuses it, so nothing that relies on Int rejecting zero
+	// has changed underneath.
+	if got := c.Int(config.KeyCompactAfter, 50); got != 50 {
+		t.Errorf("Int(compactafter=0) = %d, want the default 50", got)
+	}
+}
+
+// TestCountFallsBackLikeInt: negative and non-numeric values are typos, and a
+// typo in a threshold must not stop a push.
+func TestCountFallsBackLikeInt(t *testing.T) {
+	repoWith(t, map[string]string{"ociremote.compactafter": "-3"})
+	if got := config.Load("").Count(config.KeyCompactAfter, 50); got != 50 {
+		t.Errorf("Count(-3) = %d, want the default", got)
+	}
+	repoWith(t, map[string]string{"ociremote.compactafter": "lots"})
+	if got := config.Load("").Count(config.KeyCompactAfter, 50); got != 50 {
+		t.Errorf("Count(lots) = %d, want the default", got)
+	}
+	repoWith(t, map[string]string{"ociremote.compactafter": "7"})
+	if got := config.Load("").Count(config.KeyCompactAfter, 50); got != 7 {
+		t.Errorf("Count(7) = %d, want 7", got)
+	}
+	var nilConfig *config.Config
+	if got := nilConfig.Count(config.KeyCompactAfter, 50); got != 50 {
+		t.Errorf("Count on nil = %d, want 50", got)
 	}
 }
 

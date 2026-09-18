@@ -5,8 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"mime"
 	"sort"
 	"strings"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
@@ -28,7 +31,7 @@ func runFsck(ctx context.Context, env Env) error {
 	fs := flag.NewFlagSet("fsck", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci fsck <oci-url>
+		diag(env.Stderr, `usage: git-remote-oci fsck <oci-url>
 
 Checks that every ref published in a repository is fetchable.
 
@@ -59,14 +62,12 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 	refs, err := client.FetchRichRefIndex(ctx)
 	if err != nil {
 		if oci.IsNotFound(err) {
-			fmt.Fprintln(env.Stdout, "the repository has no refs")
-			return nil
+			return printf(env.Stdout, "the repository has no refs\n")
 		}
 		return fmt.Errorf("failed to read the ref index: %w", err)
 	}
 	if len(refs) == 0 {
-		fmt.Fprintln(env.Stdout, "the repository has no refs")
-		return nil
+		return printf(env.Stdout, "the repository has no refs\n")
 	}
 
 	refNames := make([]string, 0, len(refs))
@@ -80,36 +81,45 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 	checked := make(map[string]error)
 	broken := 0
 
+	// The published pack chain (§6.1) is advisory, but a reader that has it
+	// fetches what it names, so an entry pointing at a manifest the registry
+	// no longer serves breaks a clone as surely as a bad annotation does.
+	chain, _ := client.FetchPackChain(ctx)
+
 	for _, name := range refNames {
 		entry := refs[name]
 		if entry.SHA == "" {
-			fmt.Fprintf(env.Stderr, "%s: no commit id recorded\n", name)
+			diag(env.Stderr, "%s: no commit id recorded\n", name)
 			broken++
 			continue
 		}
 		// Start from the ref manifest, not from a commit id. For an annotated
 		// tag the index records the tag object, and no manifest is tagged with
 		// that - a fetch reaches it through the ref tag, so this must too.
-		if err := checkRef(ctx, client, name, checked); err != nil {
-			fmt.Fprintf(env.Stderr, "%s: %v\n", name, err)
+		if err := checkRef(ctx, client, name, entry.SHA, chain, checked); err != nil {
+			diag(env.Stderr, "%s: %v\n", name, err)
 			broken++
 			continue
 		}
-		fmt.Fprintf(env.Stdout, "%s ok\n", name)
+		if err := printf(env.Stdout, "%s ok\n", name); err != nil {
+			return err
+		}
 	}
 
 	head, headErr := client.FetchHead(ctx)
 	switch {
 	case headErr != nil:
-		fmt.Fprintf(env.Stderr, "could not read the recorded HEAD: %v\n", headErr)
+		diag(env.Stderr, "could not read the recorded HEAD: %v\n", headErr)
 	case head == "":
-		fmt.Fprintln(env.Stdout, "HEAD: not recorded; readers will guess")
+		if err := printf(env.Stdout, "HEAD: not recorded; readers will guess\n"); err != nil {
+			return err
+		}
 	default:
 		if _, live := refs[head]; !live {
-			fmt.Fprintf(env.Stderr, "HEAD points at %s, which is not a published ref\n", head)
+			diag(env.Stderr, "HEAD points at %s, which is not a published ref\n", head)
 			broken++
-		} else {
-			fmt.Fprintf(env.Stdout, "HEAD -> %s\n", head)
+		} else if err := printf(env.Stdout, "HEAD -> %s\n", head); err != nil {
+			return err
 		}
 	}
 
@@ -120,12 +130,12 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 	drifted := false
 	if drift := indexMirrorDrift(ctx, client, refs); len(drift) > 0 {
 		for _, line := range drift {
-			fmt.Fprintf(env.Stderr, "_index mirror: %s\n", line)
+			diag(env.Stderr, "_index mirror: %s\n", line)
 		}
-		fmt.Fprintln(env.Stderr, "_index mirror: run any push to rewrite it")
+		diag(env.Stderr, "_index mirror: run any push to rewrite it\n")
 		drifted = true
-	} else {
-		fmt.Fprintln(env.Stdout, "_index mirror matches _refs")
+	} else if err := printf(env.Stdout, "_index mirror matches _refs\n"); err != nil {
+		return err
 	}
 
 	// Reported separately, because they are different problems with different
@@ -141,13 +151,16 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
-	fmt.Fprintf(env.Stdout, "all %d refs are fetchable\n", len(refNames))
-	return nil
+	return printf(env.Stdout, "all %d refs are fetchable\n", len(refNames))
 }
 
 // checkRef verifies one ref the way a fetch resolves it: through the ref
-// manifest, then down its declared pack bases.
-func checkRef(ctx context.Context, client *oci.Client, refName string, checked map[string]error) error {
+// manifest, then down its declared pack bases, and along the published pack
+// chain from its commit.
+//
+// sha is the commit the index records for the ref, which is what the chain is
+// keyed by; for an annotated tag that is the commit the tag resolves to.
+func checkRef(ctx context.Context, client *oci.Client, refName, sha string, chain map[string][]string, checked map[string]error) error {
 	desc, err := client.ResolveRefManifest(ctx, refName)
 	if err != nil {
 		return fmt.Errorf("no ref manifest on the registry: %w", err)
@@ -155,6 +168,14 @@ func checkRef(ctx context.Context, client *oci.Client, refName string, checked m
 	manifest, err := client.FetchManifest(ctx, desc.Digest.String())
 	if err != nil {
 		return fmt.Errorf("ref manifest could not be read: %w", err)
+	}
+
+	// A manifest with no packfile has nothing to fetch. A snapshot layer
+	// carries a packfile media type too, and is not the packfile: it is the
+	// tip alone, for `--depth 1`, so a manifest holding only one of those is
+	// exactly as unclonable as one holding nothing.
+	if !hasPackfileLayer(manifest) {
+		return fmt.Errorf("ref manifest has no packfile layer")
 	}
 
 	bases, err := oci.ParsePackBases(manifest.Annotations)
@@ -166,7 +187,52 @@ func checkRef(ctx context.Context, client *oci.Client, refName string, checked m
 			return fmt.Errorf("packed against %s, which is not fetchable: %w", short(base), err)
 		}
 	}
+
+	return walkPackChain(ctx, client, sha, chain, checked, map[string]bool{})
+}
+
+// walkPackChain follows the published chain from sha, checking that every
+// manifest it names is one the registry serves and is itself fetchable.
+//
+// A reader with the chain asks for all of it in one wave, so this is the set
+// a clone of the ref actually requests. It is walked separately from the
+// annotations because the two can disagree: the chain is rewritten by whoever
+// writes `_refs` last, and a compaction that pruned manifests before
+// republishing it left entries naming manifests that were already gone.
+func walkPackChain(ctx context.Context, client *oci.Client, sha string, chain map[string][]string, checked map[string]error, visited map[string]bool) error {
+	if visited[sha] {
+		return nil
+	}
+	visited[sha] = true
+	for _, base := range chain[sha] {
+		if err := walkPackBases(ctx, client, base, checked, nil); err != nil {
+			return fmt.Errorf("the pack chain says %s was packed against %s, which is not fetchable: %w",
+				short(sha), short(base), err)
+		}
+		if err := walkPackChain(ctx, client, base, chain, checked, visited); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// hasPackfileLayer reports whether a manifest carries a packfile layer that is
+// not a tip snapshot.
+func hasPackfileLayer(manifest *ocispec.Manifest) bool {
+	for _, layer := range manifest.Layers {
+		if layer.Annotations[oci.AnnotationSnapshot] == "true" {
+			continue
+		}
+		mediaType := layer.MediaType
+		if parsed, _, err := mime.ParseMediaType(mediaType); err == nil {
+			mediaType = parsed
+		}
+		switch mediaType {
+		case oci.MediaTypeGitPackfile, oci.MediaTypeGitPackfileGzip, oci.MediaTypeGitPackfileZstd:
+			return true
+		}
+	}
+	return false
 }
 
 // walkPackBases follows a commit's declared pack bases, as a fetch would.

@@ -26,7 +26,7 @@ func runSetHead(ctx context.Context, env Env) error {
 	fs := flag.NewFlagSet("set-head", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 	fs.Usage = func() {
-		fmt.Fprint(env.Stderr, `usage: git-remote-oci set-head <oci-url> [ref]
+		diag(env.Stderr, `usage: git-remote-oci set-head <oci-url> [ref]
 
 Sets the default branch a fresh clone checks out.
 
@@ -61,11 +61,9 @@ afterwards.
 			return fmt.Errorf("failed to read the recorded HEAD: %w", err)
 		}
 		if current == "" {
-			fmt.Fprintln(env.Stdout, "no default branch is recorded")
-			return nil
+			return printf(env.Stdout, "no default branch is recorded\n")
 		}
-		fmt.Fprintln(env.Stdout, current)
-		return nil
+		return printf(env.Stdout, "%s\n", current)
 	}
 
 	refs, err := client.FetchRichRefIndex(ctx)
@@ -83,13 +81,12 @@ afterwards.
 	}
 	switch previous {
 	case ref:
-		fmt.Fprintf(env.Stdout, "%s was already the default branch\n", ref)
+		return printf(env.Stdout, "%s was already the default branch\n", ref)
 	case "":
-		fmt.Fprintf(env.Stdout, "default branch set to %s\n", ref)
+		return printf(env.Stdout, "default branch set to %s\n", ref)
 	default:
-		fmt.Fprintf(env.Stdout, "default branch moved from %s to %s\n", previous, ref)
+		return printf(env.Stdout, "default branch moved from %s to %s\n", previous, ref)
 	}
-	return nil
 }
 
 // resolveHeadRef expands a shorthand to the full ref name it names.
