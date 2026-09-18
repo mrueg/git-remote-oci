@@ -897,6 +897,16 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 	// costs round trips and never correctness. That matters: believing an
 	// incomplete chain would mean skipping a packfile and producing a
 	// repository quietly missing objects.
+	//
+	// The other direction holds too. Only a manifest's own pack-bases
+	// annotation is normative (FORMAT.md §6.1), so a manifest the chain names
+	// and the registry does not have is not a broken dependency until some
+	// annotation says it is one. A chain can name a pruned manifest -- a
+	// client that outlived a gc republishing the edges it remembered -- and a
+	// reader that failed on that made every clone fail on a hint. Such an id
+	// is dropped from the walk; if a real annotation names it later it is
+	// queued again, and then its absence is the error it always was.
+	chainOnly := make(map[string]bool)
 	if chain, ok := h.ociClient.FetchPackChain(ctx); ok {
 		for i := 0; i < len(frontier); i++ {
 			sha := frontier[i]
@@ -917,6 +927,7 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 				}
 				seen[base] = true
 				namedBy[base] = sha
+				chainOnly[base] = true
 				frontier = append(frontier, base)
 			}
 		}
@@ -936,6 +947,8 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 			manifest  *ocispec.Manifest
 			bases     []string
 			satisfied bool
+			// dropped is a chain-only id the registry does not serve.
+			dropped bool
 		}
 		out := make([]resolved, len(frontier))
 
@@ -954,6 +967,13 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 				}
 				manifest, err := h.resolveCommitManifest(lvlCtx, s, refFor[s])
 				if err != nil {
+					// chainOnly is complete before the first level starts and
+					// is only narrowed between levels, so reading it here
+					// races with nothing.
+					if chainOnly[s] && oci.IsNotFound(err) {
+						out[idx] = resolved{sha: s, dropped: true}
+						return nil
+					}
 					if parent, ok := namedBy[s]; ok {
 						return fmt.Errorf("commit %s was packed against %s, which could not be fetched: %w",
 							shortSHA(parent), shortSHA(s), err)
@@ -972,8 +992,25 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 			return nil, err
 		}
 
+		// Dropped ids are forgotten before this level's annotations are read,
+		// so an annotation in the same level that names one queues it again
+		// rather than finding it already seen.
+		for _, r := range out {
+			if !r.dropped {
+				continue
+			}
+			delete(seen, r.sha)
+			delete(chainOnly, r.sha)
+			delete(namedBy, r.sha)
+			h.logVerbose("git-remote-oci: [verbose] the published pack chain names %s, which the registry does not serve; ignoring it unless a manifest's own pack-bases names it\n",
+				shortSHA(r.sha))
+		}
+
 		next := make([]string, 0)
 		for _, r := range out {
+			if r.dropped {
+				continue
+			}
 			if r.satisfied {
 				g.satisfied[r.sha] = true
 				continue
@@ -981,6 +1018,9 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 			g.manifests[r.sha] = r.manifest
 			g.bases[r.sha] = r.bases
 			for _, b := range r.bases {
+				// Named by an annotation now, whatever the chain said: from
+				// here on its absence is a broken dependency.
+				delete(chainOnly, b)
 				if !seen[b] {
 					seen[b] = true
 					namedBy[b] = r.sha
