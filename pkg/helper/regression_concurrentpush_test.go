@@ -59,23 +59,17 @@ func TestConcurrentPushesToDifferentRefsKeepBoth(t *testing.T) {
 	// Acquiring the _refs index lock is check, write, read back -- the
 	// distribution API has no compare-and-swap on a tag, which the README's
 	// limitations table says out loud -- so two clients starting together can
-	// both come out believing they hold it. The second one's write is a
-	// takeover; the first then refuses to release a lock that is no longer
-	// its own and reports the push as not reliably visible, even though its
-	// index write had already landed. That is the documented compensating
-	// outcome, and it is allowed here. What is not allowed is a push that
-	// says "ok" for a ref the registry then does not show, or one that
-	// fails for any other reason.
+	// both come out believing they hold it. Two pushes to different refs
+	// against a fast registry hit that window readily. It used to make the
+	// loser report its ref as not reliably visible although its index write
+	// had landed; now the loser reads the published index back and either
+	// confirms its entry or redoes the update, so both pushes must say "ok".
 	for i, ref := range []string{"a", "b"} {
 		if results[i].err != nil {
 			t.Fatalf("push of refs/heads/%s failed: %v (output %q)", ref, results[i].err, results[i].out)
 		}
-		switch out := results[i].out; {
-		case strings.Contains(out, "ok refs/heads/"+ref):
-		case strings.Contains(out, "error refs/heads/"+ref) && strings.Contains(out, "_refs index"):
-			t.Logf("push of refs/heads/%s hit the index-lock window and reported:\n%s", ref, out)
-		default:
-			t.Errorf("push of refs/heads/%s neither succeeded nor reported the index-lock window:\n%s", ref, out)
+		if out := results[i].out; !strings.Contains(out, "ok refs/heads/"+ref) {
+			t.Errorf("push of refs/heads/%s did not report ok:\n%s", ref, out)
 		}
 	}
 
