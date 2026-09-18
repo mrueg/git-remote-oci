@@ -627,7 +627,7 @@ git config remote.origin.ociPushLockTTL 30m
 | `chunkSize` | `32m` | Send blobs larger than this in chunks of this size, so a failed upload resumes instead of restarting. Accepts `k`/`m`/`g`. `0` sends every blob in one request. A registry that will not take chunked uploads falls back automatically. |
 | `concurrency` | `12` | Workers fetching manifests and packfiles, and uploading LFS objects. Lower it for a registry that rate-limits, or a slow link. |
 | `blobConcurrency` | `64` | Workers for the wide blob fan-out when pushing many refs at once. Larger because those requests mostly wait on the registry. |
-| `pushLockTTL` | `10m` | How long one ref's push may hold its lock. Must exceed the time to generate and upload the packfile, or another client can legitimately take the lock mid-push. |
+| `pushLockTTL` | `10m` | How long one ref's push may hold its lock. Must exceed the time to generate and upload the packfile, or another client can legitimately take the lock mid-push. A push still running at 80% of the TTL is warned on stderr, and warned again if the TTL lapses, so a value that is too small for the repository is noticed before it costs anything. |
 | `indexLockTTL` | `5m` | How long the `_refs` index lock is held. Covers fetching the index, listing refs and pushing four objects. |
 | `lfsIndexLockTTL` | `15s` | How long the `_lfs_locks` index lock is held. A shorter critical section: one read-modify-write of a single blob. |
 
