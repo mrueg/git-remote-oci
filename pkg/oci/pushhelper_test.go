@@ -13,11 +13,11 @@ import (
 // these tests. Keeping it as a test helper takes it out of the package's public
 // surface without changing what the tests do, since it is only a buffered
 // PushCommitStream.
-func pushCommitImage(ctx context.Context, client *oci.Client, commitSHA, refName, refTag string, data []byte) error {
+func pushCommitImage(ctx context.Context, client *oci.Client, commitSHA, refName string, writeRefTag bool, data []byte) error {
 	return client.PushCommitStream(ctx, oci.CommitPush{
-		CommitSHA: commitSHA,
-		RefName:   refName,
-		RefTag:    refTag,
+		CommitSHA:   commitSHA,
+		RefName:     refName,
+		WriteRefTag: writeRefTag,
 	}, bytes.NewReader(data), int64(len(data)))
 }
 

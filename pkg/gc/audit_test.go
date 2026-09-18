@@ -59,9 +59,7 @@ func pushOne(t *testing.T, client *oci.Client, repo *git.Repository, push oci.Co
 		t.Fatalf("CreatePackfileTo(%s): %v", want, err)
 	}
 	push.PackBases = bases
-	if push.RefTag == "" {
-		push.RefTag = oci.EncodeRefTag(push.RefName)
-	}
+	push.WriteRefTag = true
 	if err := client.PushCommitStream(context.Background(), push, bytes.NewReader(pack.Bytes()), int64(pack.Len())); err != nil {
 		t.Fatalf("push %s: %v", push.RefName, err)
 	}

@@ -155,9 +155,9 @@ func TestConfigDiffIDMatchesUncompressedLayer(t *testing.T) {
 			client := registrytest.Client(t, ts)
 			commitSHA := "1111111111111111111111111111111111111111"
 			err := client.PushCommitStream(context.Background(), oci.CommitPush{
-				CommitSHA: commitSHA,
-				RefName:   "refs/heads/main",
-				RefTag:    "main",
+				CommitSHA:   commitSHA,
+				RefName:     "refs/heads/main",
+				WriteRefTag: true,
 			}, bytes.NewReader(payload), int64(len(payload)))
 			if err != nil {
 				t.Fatalf("push: %v", err)
@@ -208,7 +208,7 @@ func TestOCIImageIndexEntriesArePlatformQualified(t *testing.T) {
 	ctx := context.Background()
 
 	commitSHA := "2222222222222222222222222222222222222222"
-	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", "main", []byte("PACK-x")); err != nil {
+	if err := pushCommitImage(ctx, client, commitSHA, "refs/heads/main", true, []byte("PACK-x")); err != nil {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 	if err := client.PushOCIImageIndex(ctx, oci.TagOCIIndex, map[string]oci.RefEntry{

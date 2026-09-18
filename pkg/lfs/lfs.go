@@ -16,7 +16,8 @@ import (
 // MediaTypeGitLFSBlob is the custom OCI layer media type for Git LFS payload blobs
 const MediaTypeGitLFSBlob = "application/vnd.git.lfs.v1+blob"
 
-// AnnotationLFSField identifies LFS pointer OID in OCI layer annotations
+// AnnotationLFSOID is the OCI layer annotation carrying the LFS pointer's
+// object id; AnnotationLFSSize carries the object's size in bytes.
 const AnnotationLFSOID = "org.git.lfs.oid"
 const AnnotationLFSSize = "org.git.lfs.size"
 
@@ -24,11 +25,6 @@ const AnnotationLFSSize = "org.git.lfs.size"
 type Pointer struct {
 	Oid  string // SHA256 hex string without "sha256:" prefix
 	Size int64  // File size in bytes
-}
-
-// formatPointer returns the canonical Git LFS pointer text format
-func (p *Pointer) formatPointer() string {
-	return fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", p.Oid, p.Size)
 }
 
 // ParsePointer parses content bytes into an LFS Pointer, returning nil if the

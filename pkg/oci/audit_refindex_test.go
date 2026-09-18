@@ -266,9 +266,9 @@ func TestIndexMirrorNamesTheRefManifestTag(t *testing.T) {
 	}
 	pack := []byte("not a real packfile")
 	if err := client.PushCommitStream(ctx, oci.CommitPush{
-		CommitSHA: commit,
-		RefName:   ref,
-		RefTag:    oci.EncodeRefTag(ref),
+		CommitSHA:   commit,
+		RefName:     ref,
+		WriteRefTag: true,
 	}, bytes.NewReader(pack), int64(len(pack))); err != nil {
 		t.Fatalf("PushCommitStream: %v", err)
 	}

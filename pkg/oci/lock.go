@@ -131,6 +131,12 @@ func (c *Client) lockStateByTag(ctx context.Context, tag string) (bool, *LockInf
 
 	// An expired lock is not a lock. Without this the TTL is decorative and a
 	// client that crashed mid-push wedges the ref permanently.
+	//
+	// The expiry was stamped by the writer's clock and is judged by this
+	// reader's, so skew between the two shortens or lengthens the effective
+	// TTL by that much. A registry runs no code and has no clock to consult,
+	// so there is nothing to compare against; TTLs are chosen with minutes of
+	// slack for that reason.
 	if !time.Now().UTC().Before(expiresAt) {
 		return false, nil, nil
 	}
