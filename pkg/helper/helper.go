@@ -1234,6 +1234,24 @@ func (h *Helper) reportKeptPacks(kept *keptPacks) {
 	}
 }
 
+// commonDir is git.CommonDir for the paths that must not guess.
+//
+// CommonDir still returns a path when no repository can be located -- ".git"
+// against the working directory -- because some callers have nothing better
+// to do with the answer. The shallow file and the LFS object cache are not
+// among them: writing either under a directory that is not a repository would
+// leave the boundary or the object somewhere git never looks, and the fetch
+// would report success. Git always sets GIT_DIR before running a remote
+// helper, so this fails only for a caller that is not git; it should fail
+// out loud when it does.
+func commonDir() (string, error) {
+	dir, ok := git.CommonDir()
+	if !ok {
+		return "", fmt.Errorf("failed to locate the git repository: GIT_DIR is unset and no .git directory was found above the working directory")
+	}
+	return dir, nil
+}
+
 // markShallowBoundary records sha as a shallow boundary in $GIT_DIR/shallow.
 //
 // Fetch workers run concurrently, so the read-modify-write is serialised under
@@ -1250,7 +1268,10 @@ func (h *Helper) markShallowBoundary(sha string) error {
 	//
 	// The common directory, not GIT_DIR: in a linked worktree GIT_DIR is the
 	// per-worktree directory and git reads the shallow file from the shared one.
-	gitDir, _ := git.CommonDir()
+	gitDir, err := commonDir()
+	if err != nil {
+		return err
+	}
 	shallowPath := filepath.Join(gitDir, "shallow")
 
 	content, err := os.ReadFile(shallowPath)
@@ -1454,7 +1475,10 @@ func (h *Helper) uploadLFSObjects(ctx context.Context, objects []plumbing.Hash, 
 
 	// git-lfs keeps its objects under the common directory, which in a linked
 	// worktree is not GIT_DIR.
-	gitDir, _ := git.CommonDir()
+	gitDir, err := commonDir()
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		mu    sync.Mutex
@@ -1685,7 +1709,10 @@ func (h *Helper) downloadLFSObjects(ctx context.Context, sha string, manifest *o
 		return nil
 	}
 	// The common directory, as in uploadLFSObjects: git-lfs looks there.
-	gitDir, _ := git.CommonDir()
+	gitDir, err := commonDir()
+	if err != nil {
+		return err
+	}
 
 	var lfsLayers []ocispec.Descriptor
 	for _, layer := range manifest.Layers {
