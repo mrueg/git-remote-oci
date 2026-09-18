@@ -7,7 +7,7 @@ finished".
 ## Before you open a pull request
 
 ```bash
-make check      # fmt, tidy, vet, lint, unit tests with -race
+make check      # fmt, tidy, vet, lint, unit tests with -race, govulncheck
 make e2e        # end-to-end against a throwaway registry:3 (needs Docker)
 ```
 
