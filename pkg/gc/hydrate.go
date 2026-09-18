@@ -155,8 +155,15 @@ func manifestOrder(ctx context.Context, client *oci.Client, refs map[string]oci.
 	state := map[string]int{}
 	var order []stagedManifest
 
-	var visit func(key, chainKey string, path []string) error
-	visit = func(key, chainKey string, path []string) error {
+	// advisory says the key is known from the published chain alone: no
+	// annotation has named it, so a manifest the registry does not serve is
+	// left out rather than reported. A chain can name a pruned manifest -- a
+	// client that outlived a gc republishing the edges it remembered -- and
+	// only a manifest's own pack-bases is normative (§6.1). The key is put
+	// back to unvisited so an annotation naming it later fetches it again and
+	// fails the way a declared base that cannot be fetched must.
+	var visit func(key, chainKey string, path []string, advisory bool) error
+	visit = func(key, chainKey string, path []string, advisory bool) error {
 		switch state[key] {
 		case done:
 			return nil
@@ -171,6 +178,10 @@ func manifestOrder(ctx context.Context, client *oci.Client, refs map[string]oci.
 
 		manifest, err := fetchStagedManifest(ctx, client, key)
 		if err != nil {
+			if advisory && oci.IsNotFound(err) {
+				delete(state, key)
+				return nil
+			}
 			return err
 		}
 		bases, err := oci.ParsePackBases(manifest.Annotations)
@@ -180,9 +191,15 @@ func manifestOrder(ctx context.Context, client *oci.Client, refs map[string]oci.
 		// The published chain (§6.1) is only a shortcut for discovering the
 		// graph in fewer round trips; the annotation above is what decides
 		// what has to be imported, so anything the chain adds beyond it is
-		// extra history rather than a correction.
-		for _, base := range append(bases, chain[chainKey]...) {
-			if err := visit(base, base, append(path, key)); err != nil {
+		// extra history rather than a correction -- and, when the registry
+		// does not have it, not a correction the other way either.
+		for _, base := range bases {
+			if err := visit(base, base, append(path, key), false); err != nil {
+				return err
+			}
+		}
+		for _, base := range chain[chainKey] {
+			if err := visit(base, base, append(path, key), true); err != nil {
 				return err
 			}
 		}
@@ -193,7 +210,7 @@ func manifestOrder(ctx context.Context, client *oci.Client, refs map[string]oci.
 	}
 
 	for _, start := range tips {
-		if err := visit(start.key, start.chainKey, nil); err != nil {
+		if err := visit(start.key, start.chainKey, nil, false); err != nil {
 			return nil, err
 		}
 	}
