@@ -82,18 +82,55 @@ func TestSubcommandsReportAnUnreachableRegistry(t *testing.T) {
 	}
 }
 
-// TestGCOutsideAGitRepositoryExplainsItself: gc builds its packfiles from local
-// objects, so it needs a repository — and should say so rather than failing
-// somewhere deep in go-git.
-func TestGCOutsideAGitRepositoryExplainsItself(t *testing.T) {
-	url := emptyRegistry(t)
-	t.Chdir(t.TempDir())
+// TestGCOutsideAGitRepositorySucceeds: gc is meant to run as a scheduled job
+// next to the registry, where there is no clone. Objects it cannot find
+// locally are fetched from the registry, so outside a repository it must
+// complete and report what it did -- not fail somewhere deep in go-git, and
+// not fail politely either.
+//
+// This used to assert only inside `if err != nil`, so a run that succeeded
+// passed without checking anything.
+func TestGCOutsideAGitRepositorySucceeds(t *testing.T) {
+	t.Run("empty registry", func(t *testing.T) {
+		url := emptyRegistry(t)
+		t.Setenv("GIT_DIR", "")
+		t.Chdir(t.TempDir())
 
-	// An empty repository short-circuits before the local objects are needed,
-	// so this asserts only that it does not fail confusingly.
-	if _, _, err := runCLI(t, "gc", url); err != nil {
-		if !strings.Contains(err.Error(), "git repository") {
-			t.Errorf("gc outside a repository should explain itself, got: %v", err)
+		stdout, stderr, err := runCLI(t, "gc", url)
+		if err != nil {
+			t.Fatalf("gc outside a repository against an empty registry: %v\nstderr: %s", err, stderr)
 		}
-	}
+		if !strings.Contains(stdout, "repacked 0 refs") {
+			t.Errorf("gc should report that nothing was repacked, got stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "no refs") {
+			t.Errorf("gc should explain there was nothing to do, got stderr: %q", stderr)
+		}
+	})
+
+	t.Run("populated registry", func(t *testing.T) {
+		reg := registrytest.New()
+		ts := reg.Serve(t)
+		registrytest.SeedRepository(t, registrytest.Client(t, ts), 3)
+		tagsBefore := len(reg.Tags())
+
+		// Seeding left GIT_DIR pointing at the source clone; gc must not have
+		// it. Anything it needs comes back down from the registry.
+		t.Setenv("GIT_DIR", "")
+		t.Chdir(t.TempDir())
+
+		stdout, stderr, err := runCLI(t, "gc", registrytest.URL(ts))
+		if err != nil {
+			t.Fatalf("gc outside a repository against a populated registry: %v\nstderr: %s", err, stderr)
+		}
+		if !strings.Contains(stdout, "repacked 1 refs") {
+			t.Errorf("gc should report the one ref it repacked, got stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "fetching them to repack") {
+			t.Errorf("gc should say it fetched the history it did not have, got stderr: %q", stderr)
+		}
+		if after := len(reg.Tags()); after >= tagsBefore {
+			t.Errorf("gc did not prune anything: %d tags before, %d after", tagsBefore, after)
+		}
+	})
 }
