@@ -329,10 +329,13 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 	// consolidation; a missing index reads as "unknown" and falls back.
 	//
 	// Listed before the packfile goroutine starts: both walk the same go-git
-	// storer, and that is not safe to do from two goroutines at once.
+	// storer, and that is not safe to do from two goroutines at once. The
+	// list is handed to the packer as well, so its pure-Go fallback does not
+	// walk the whole history a second time.
 	var extraLayers []ocispec.Descriptor
-	if objects, idxErr := repo.PackedObjects(wantHash, nil); idxErr == nil {
-		if desc, pushErr := client.PushPackIndex(ctx, packIndexEntries(objects)); pushErr == nil && desc.Digest != "" {
+	objects, listErr := repo.RevList(wantHash, nil)
+	if listErr == nil {
+		if desc, pushErr := client.PushPackIndex(ctx, packIndexEntries(repo.PackedObjectsOf(objects))); pushErr == nil && desc.Digest != "" {
 			extraLayers = append(extraLayers, desc)
 		}
 	}
@@ -354,8 +357,9 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 
 	pr, pw := io.Pipe()
 	go func() {
-		// No haveHashes: the point is a self-contained pack.
-		_ = pw.CloseWithError(repo.CreatePackfileTo(pw, wantHash, nil))
+		// No haveHashes: the point is a self-contained pack. A nil list --
+		// the walk above failed -- lets the fallback compute its own.
+		_ = pw.CloseWithError(repo.CreatePackfileFromListTo(pw, wantHash, nil, objects))
 	}()
 
 	// No parents and no pack bases: a consolidated packfile carries the whole

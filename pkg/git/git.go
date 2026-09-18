@@ -400,6 +400,18 @@ func (r *Repository) GetCommitInfo(hash plumbing.Hash) (*object.Commit, error) {
 // Falls back to the pure-Go encoder if git cannot be used. A non-thin pack is
 // always valid, so degrading costs bandwidth and nothing else.
 func (r *Repository) CreatePackfileTo(writer io.Writer, wantHash plumbing.Hash, haveHashes []plumbing.Hash) error {
+	return r.CreatePackfileFromListTo(writer, wantHash, haveHashes, nil)
+}
+
+// CreatePackfileFromListTo is CreatePackfileTo for a caller that has already
+// computed the range's object list with RevList.
+//
+// The thin path hands git the revision range and never needs the list. The
+// pure-Go fallback does, and used to walk the repository again to get it --
+// the third such walk on a push, after the LFS scan and the pack index. A
+// nil list means the fallback computes its own, which is what CreatePackfileTo
+// does.
+func (r *Repository) CreatePackfileFromListTo(writer io.Writer, wantHash plumbing.Hash, haveHashes []plumbing.Hash, objects []plumbing.Hash) error {
 	if err := r.createThinPackfile(writer, wantHash, haveHashes); err == nil {
 		return nil
 	} else if errors.Is(err, errPackWritten) {
@@ -407,7 +419,13 @@ func (r *Repository) CreatePackfileTo(writer io.Writer, wantHash plumbing.Hash, 
 		// already poisoned and cannot be retried with a different encoder.
 		return err
 	}
-	return r.createPackfileWithGoGit(writer, wantHash, haveHashes)
+	if objects == nil {
+		var err error
+		if objects, err = r.RevList(wantHash, haveHashes); err != nil {
+			return fmt.Errorf("failed to calculate revlist: %w", err)
+		}
+	}
+	return r.createPackfileWithGoGit(writer, objects)
 }
 
 // errPackWritten marks a failure that occurred after output had begun.
@@ -476,24 +494,12 @@ func (r *Repository) createThinPackfile(writer io.Writer, wantHash plumbing.Hash
 	return nil
 }
 
-func (r *Repository) createPackfileWithGoGit(writer io.Writer, wantHash plumbing.Hash, haveHashes []plumbing.Hash) error {
-	peeledHash := wantHash
-	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
-		peeledHash = tagObj.Target
-	}
-
-	wants := []plumbing.Hash{peeledHash}
-	if peeledHash != wantHash {
-		wants = append(wants, wantHash)
-	}
-
-	hashes, err := revlist.Objects(r.storer, wants, haveHashes)
-	if err != nil {
-		return fmt.Errorf("failed to calculate revlist: %w", err)
-	}
-
+// createPackfileWithGoGit encodes exactly the objects it is given, in one
+// non-thin pack. The list is RevList's, so the thin path and this one agree on
+// what a range carries.
+func (r *Repository) createPackfileWithGoGit(writer io.Writer, objects []plumbing.Hash) error {
 	enc := packfile.NewEncoder(writer, r.storer, true)
-	if _, err := enc.Encode(hashes, 10); err != nil {
+	if _, err := enc.Encode(objects, 10); err != nil {
 		return fmt.Errorf("failed to encode packfile: %w", err)
 	}
 	return nil
@@ -1005,6 +1011,56 @@ func (r *Repository) IsAncestor(ancestor, descendant plumbing.Hash) (bool, error
 	// ForEach returns storer.ErrStop when iteration is stopped early; this is not an error
 	if err != nil && !errors.Is(err, storer.ErrStop) {
 		return false, fmt.Errorf("failed to walk commit history: %w", err)
+	}
+	return found, nil
+}
+
+// AncestorsAmong reports which of candidates are ancestors of descendant
+// (a commit counts as its own ancestor), in one walk.
+//
+// A push compares its tip against every remote ref twice over: the
+// fast-forward check against the ref it updates, and pack-base selection
+// against all of them. Asking IsAncestor once per ref walked the history once
+// per ref, and a candidate that is not an ancestor -- every other branch in
+// the repository -- costs the entire walk before the answer is no. One walk
+// from descendant answers for all of them, and it still stops as soon as the
+// last candidate is found, so a single-branch push stays as cheap as before.
+//
+// An unknown or non-commit descendant is an error, as it is for IsAncestor.
+func (r *Repository) AncestorsAmong(descendant plumbing.Hash, candidates []plumbing.Hash) (map[plumbing.Hash]bool, error) {
+	commit, err := r.repo.CommitObject(descendant)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit %s: %w", descendant, err)
+	}
+
+	found := make(map[plumbing.Hash]bool, len(candidates))
+	remaining := make(map[plumbing.Hash]bool, len(candidates))
+	for _, c := range candidates {
+		if c == descendant {
+			found[c] = true
+			continue
+		}
+		remaining[c] = true
+	}
+	if len(remaining) == 0 {
+		return found, nil
+	}
+
+	iter := object.NewCommitPreorderIter(commit, nil, nil)
+	defer iter.Close()
+
+	err = iter.ForEach(func(c *object.Commit) error {
+		if remaining[c.Hash] {
+			found[c.Hash] = true
+			delete(remaining, c.Hash)
+			if len(remaining) == 0 {
+				return storer.ErrStop
+			}
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, storer.ErrStop) {
+		return nil, fmt.Errorf("failed to walk commit history: %w", err)
 	}
 	return found, nil
 }

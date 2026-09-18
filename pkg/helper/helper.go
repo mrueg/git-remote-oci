@@ -1319,7 +1319,12 @@ func (h *Helper) fetchManifestByRef(ctx context.Context, refName string) (*ocisp
 // would be the safe direction for correctness, but it silently turns an
 // incremental push into a full one, and an unreachable registry is worth
 // reporting rather than papering over.
-func (h *Helper) packBases(ctx context.Context, srcHash plumbing.Hash, remoteSnapshot map[string]string) ([]plumbing.Hash, error) {
+//
+// ancestors is remoteAncestors' answer for srcHash: the walk is done once per
+// pushed ref and shared with the fast-forward check, where it used to be one
+// walk per remote ref here and another there. A nil set -- the walk failed --
+// selects no bases, which is what a failed walk per candidate used to do.
+func (h *Helper) packBases(ctx context.Context, srcHash plumbing.Hash, remoteSnapshot map[string]string, ancestors map[plumbing.Hash]bool) ([]plumbing.Hash, error) {
 	if os.Getenv("GIT_REMOTE_OCI_FULL_PACK") != "" {
 		return nil, nil
 	}
@@ -1337,8 +1342,7 @@ func (h *Helper) packBases(ctx context.Context, srcHash plumbing.Hash, remoteSna
 		}
 		seen[rHash] = true
 
-		isAncestor, err := h.gitRepo.IsAncestor(rHash, srcHash)
-		if err != nil || !isAncestor {
+		if !ancestors[rHash] {
 			continue
 		}
 		candidates = append(candidates, remoteSHA)
@@ -1360,6 +1364,32 @@ func (h *Helper) packBases(ctx context.Context, srcHash plumbing.Hash, remoteSna
 		bases = append(bases, plumbing.NewHash(base))
 	}
 	return bases, nil
+}
+
+// remoteAncestors walks srcHash's history once and reports which remote refs
+// it reaches: the input to both the fast-forward check and packBases.
+//
+// Every published commit id is a candidate, whether or not it will end up as
+// a base, so the one walk answers every question a push asks about the remote
+// state. It stops when the last candidate is found; a repository with
+// branches the tip does not descend from costs the walk once, where it used
+// to cost it once per such branch.
+func (h *Helper) remoteAncestors(srcHash plumbing.Hash, remoteSnapshot map[string]string) (map[plumbing.Hash]bool, error) {
+	commitSHA := srcHash.String()
+	seen := make(map[plumbing.Hash]bool, len(remoteSnapshot))
+	candidates := make([]plumbing.Hash, 0, len(remoteSnapshot))
+	for _, remoteSHA := range remoteSnapshot {
+		if remoteSHA == "" || remoteSHA == commitSHA || !oci.IsCommitID(remoteSHA) {
+			continue
+		}
+		rHash := plumbing.NewHash(remoteSHA)
+		if seen[rHash] {
+			continue
+		}
+		seen[rHash] = true
+		candidates = append(candidates, rHash)
+	}
+	return h.gitRepo.AncestorsAmong(srcHash, candidates)
 }
 
 // packBaseStrings renders bases for the manifest annotation.
@@ -1405,10 +1435,14 @@ func (h *Helper) ensureGitRepo() error {
 //     warning, and the push carries on without that blob.
 //   - a failed upload means the ref about to be published would reference a
 //     blob the registry does not have. That fails the ref.
-func (h *Helper) uploadLFSObjects(ctx context.Context, srcHash plumbing.Hash, haveHashes []plumbing.Hash, label string) ([]ocispec.Descriptor, error) {
+//
+// objects is the range's object list from git.Repository.RevList, computed
+// once by the caller and shared with the pack index and the packing fallback;
+// this used to be one of three walks over the same range on every push.
+func (h *Helper) uploadLFSObjects(ctx context.Context, objects []plumbing.Hash, label string) ([]ocispec.Descriptor, error) {
 	defer h.timer.phase("upload LFS objects")()
 
-	pointers, err := h.gitRepo.ScanLFSPointers(srcHash, haveHashes)
+	pointers, err := h.gitRepo.ScanLFSPointersIn(objects)
 	if err != nil {
 		// Discarding this silently pushed a ref with no LFS objects at all and
 		// said nothing about why.
@@ -1552,24 +1586,19 @@ func (h *Helper) snapshotLayer(ctx context.Context, commitSHA string, tip plumbi
 // The list is derived from the same revision range the packfile was cut from
 // rather than read out of a real .idx, because there is no .idx to read: the
 // pushed pack is thin, and a thin pack cannot be indexed on its own — the whole
-// point of it is that it references bases it does not carry. Recomputing from
-// want and haves gives the same answer, and gives it without writing the pack
-// to disk first.
+// point of it is that it references bases it does not carry. The range's
+// object list is the caller's, from git.Repository.RevList, so the index and
+// the LFS scan describe the same objects without either walking again.
 //
 // Like snapshotLayer, a failure here is not a failed push. The index only ever
 // saves a download; a push that publishes none is correct, just less kind to
 // whoever clones it.
-func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, haveHashes []plumbing.Hash) (ocispec.Descriptor, bool) {
+func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, objects []plumbing.Hash) (ocispec.Descriptor, bool) {
 	defer h.timer.phase("build pack index")()
 
-	objects, err := h.gitRepo.PackedObjects(wantHash, haveHashes)
-	if err != nil {
-		h.logWarn("git-remote-oci: warning: could not list the objects in the packfile for %s: %v\n",
-			shortSHA(wantHash.String()), err)
-		return ocispec.Descriptor{}, false
-	}
-	entries := make([]oci.PackIndexEntry, 0, len(objects))
-	for _, o := range objects {
+	packed := h.gitRepo.PackedObjectsOf(objects)
+	entries := make([]oci.PackIndexEntry, 0, len(packed))
+	for _, o := range packed {
 		entries = append(entries, oci.PackIndexEntry{OID: o.OID, Size: o.Size})
 	}
 
@@ -1869,18 +1898,20 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		remoteSnapshot := h.snapshotRemoteRefs()
 		existingSHA, exists := remoteSnapshot[dstRef]
 
+		// One walk answers both the fast-forward check and pack-base
+		// selection below.
+		ancestors, ancestorErr := h.remoteAncestors(srcHash, remoteSnapshot)
+
 		if exists && existingSHA != commitSHA && !force {
-			remoteHash := plumbing.NewHash(existingSHA)
-			isAncestor, ancestorErr := h.gitRepo.IsAncestor(remoteHash, srcHash)
 			if ancestorErr != nil {
 				return failReport(dstRef, "non-fast-forward update rejected (use '+' to force): remote is %s", shortSHA(existingSHA))
 			}
-			if !isAncestor {
+			if !ancestors[plumbing.NewHash(existingSHA)] {
 				return failReport(dstRef, "non-fast-forward update rejected (use '+' to force)")
 			}
 		}
 
-		haveHashes, err := h.packBases(pCtx, srcHash, remoteSnapshot)
+		haveHashes, err := h.packBases(pCtx, srcHash, remoteSnapshot, ancestors)
 		if err != nil {
 			return failReport(dstRef, "%v", err)
 		}
@@ -1925,14 +1956,21 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			return okReport(dstRef)
 		}
 
+		// The range's object list, once: the LFS scan, the pack index and the
+		// packing fallback all read it, and each used to walk for its own.
+		objects, err := h.gitRepo.RevList(wantHash, haveHashes)
+		if err != nil {
+			return failReport(dstRef, "failed to list the objects the push carries: %v", err)
+		}
+
 		pr, pw := io.Pipe()
 		go func() {
-			err := h.gitRepo.CreatePackfileTo(pw, wantHash, haveHashes)
+			err := h.gitRepo.CreatePackfileFromListTo(pw, wantHash, haveHashes, objects)
 			_ = pw.CloseWithError(err)
 		}()
 
 		var lfsDescs []ocispec.Descriptor
-		if descs, lfsErr := h.uploadLFSObjects(pCtx, srcHash, haveHashes, ""); lfsErr != nil {
+		if descs, lfsErr := h.uploadLFSObjects(pCtx, objects, ""); lfsErr != nil {
 			_ = pr.CloseWithError(lfsErr)
 			return failReport(dstRef, "%v", lfsErr)
 		} else {
@@ -1947,7 +1985,7 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 
 		// What is in that packfile, so a lazy fetch can rule it out without
 		// downloading it.
-		if idx, ok := h.packIndexLayer(pCtx, wantHash, haveHashes); ok {
+		if idx, ok := h.packIndexLayer(pCtx, wantHash, objects); ok {
 			lfsDescs = append(lfsDescs, idx)
 		}
 
@@ -2165,14 +2203,17 @@ type parsedPushSpec struct {
 	srcHash  plumbing.Hash
 	// wantHash is what the packfile is cut for: the target of an annotated
 	// tag, and otherwise srcHash. See tagAnnotations.
-	wantHash      plumbing.Hash
-	commitSHA     string
-	commit        *object.Commit
-	tagInfo       *git.AnnotatedTagInfo
-	tagAnnoMap    map[string]string
-	parentsStr    string
-	refTag        string
-	haveHashes    []plumbing.Hash
+	wantHash   plumbing.Hash
+	commitSHA  string
+	commit     *object.Commit
+	tagInfo    *git.AnnotatedTagInfo
+	tagAnnoMap map[string]string
+	parentsStr string
+	refTag     string
+	haveHashes []plumbing.Hash
+	// objects is the range's object list (RevList), computed once at
+	// validation and shared by every consumer in the upload phase.
+	objects       []plumbing.Hash
 	validationErr string
 }
 
@@ -2232,15 +2273,17 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			}
 		}
 
+		// One walk for the fast-forward check and pack-base selection, as on
+		// the non-atomic path.
+		ancestors, ancestorErr := h.remoteAncestors(srcHash, h.remoteRefs)
+
 		if existingSHA, exists := h.remoteRefs[dstRef]; exists && existingSHA != commitSHA && !force {
-			remoteHash := plumbing.NewHash(existingSHA)
-			isAncestor, ancestorErr := h.gitRepo.IsAncestor(remoteHash, srcHash)
 			if ancestorErr != nil {
 				parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: fmt.Sprintf("non-fast-forward update rejected (use '+' to force): remote is %s", shortSHA(existingSHA))}
 				hasValidationError = true
 				continue
 			}
-			if !isAncestor {
+			if !ancestors[plumbing.NewHash(existingSHA)] {
 				parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: "non-fast-forward update rejected (use '+' to force)"}
 				hasValidationError = true
 				continue
@@ -2250,7 +2293,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		// The same rule as the non-atomic path. This used to accept any remote
 		// ref whose commit merely existed locally, which excluded objects that a
 		// clone of this ref alone would never be given.
-		haveHashes, baseErr := h.packBases(ctx, srcHash, h.remoteRefs)
+		haveHashes, baseErr := h.packBases(ctx, srcHash, h.remoteRefs, ancestors)
 		if baseErr != nil {
 			parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: baseErr.Error()}
 			hasValidationError = true
@@ -2270,6 +2313,16 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		}
 		tagInfo, tagAnnoMap, wantHash := h.tagAnnotations(srcRef, srcHash)
 
+		// Listed here, before anything is uploaded, so a range that cannot be
+		// walked fails validation like every other bad spec rather than a
+		// half-applied batch.
+		objects, listErr := h.gitRepo.RevList(wantHash, haveHashes)
+		if listErr != nil {
+			parsedSpecs[i] = parsedPushSpec{dstRef: dstRef, validationErr: fmt.Sprintf("failed to list the objects the push carries: %v", listErr)}
+			hasValidationError = true
+			continue
+		}
+
 		parsedSpecs[i] = parsedPushSpec{
 			force:      force,
 			srcRef:     srcRef,
@@ -2283,6 +2336,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			parentsStr: parentsOf(commit),
 			refTag:     refTag,
 			haveHashes: haveHashes,
+			objects:    objects,
 		}
 	}
 
@@ -2313,7 +2367,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			}
 			pr, pw := io.Pipe()
 			go func(p parsedPushSpec) {
-				err := h.gitRepo.CreatePackfileTo(pw, p.wantHash, p.haveHashes)
+				err := h.gitRepo.CreatePackfileFromListTo(pw, p.wantHash, p.haveHashes, p.objects)
 				_ = pw.CloseWithError(err)
 			}(parsed)
 			_, err := io.Copy(io.Discard, pr)
@@ -2347,13 +2401,13 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 
 		pr, pw := io.Pipe()
 		go func(p parsedPushSpec) {
-			err := h.gitRepo.CreatePackfileTo(pw, p.wantHash, p.haveHashes)
+			err := h.gitRepo.CreatePackfileFromListTo(pw, p.wantHash, p.haveHashes, p.objects)
 			_ = pw.CloseWithError(err)
 		}(parsed)
 
 		// An LFS failure here must fail the whole batch: the ref would otherwise
 		// be published referencing blobs the registry does not have.
-		lfsDescs, lfsErr := h.uploadLFSObjects(ctx, parsed.srcHash, parsed.haveHashes, " (atomic)")
+		lfsDescs, lfsErr := h.uploadLFSObjects(ctx, parsed.objects, " (atomic)")
 		if lfsErr != nil {
 			_ = pr.CloseWithError(lfsErr)
 			pushErr = lfsErr
@@ -2363,7 +2417,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		if snap, ok := h.snapshotLayer(ctx, parsed.commitSHA, parsed.wantHash); ok {
 			lfsDescs = append(lfsDescs, snap)
 		}
-		if idx, ok := h.packIndexLayer(ctx, parsed.wantHash, parsed.haveHashes); ok {
+		if idx, ok := h.packIndexLayer(ctx, parsed.wantHash, parsed.objects); ok {
 			lfsDescs = append(lfsDescs, idx)
 		}
 
