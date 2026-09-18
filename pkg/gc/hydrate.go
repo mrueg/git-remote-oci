@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -48,7 +50,7 @@ func (h *hydrated) Close() {
 // temporary directory, so $TMPDIR is how to put it somewhere with space when
 // the default is a small tmpfs — the same consideration the push path has, for
 // the same reason.
-func hydrate(ctx context.Context, client *oci.Client, entries []oci.RefEntry, logf func(string, ...any)) (*hydrated, error) {
+func hydrate(ctx context.Context, client *oci.Client, refs map[string]oci.RefEntry, logf func(string, ...any)) (*hydrated, error) {
 	dir, err := os.MkdirTemp("", "git-remote-oci-gc-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a scratch object store: %w", err)
@@ -68,7 +70,7 @@ func hydrate(ctx context.Context, client *oci.Client, entries []oci.RefEntry, lo
 		return nil, err
 	}
 
-	order, err := manifestOrder(ctx, client, entries)
+	order, err := manifestOrder(ctx, client, refs)
 	if err != nil {
 		h.Close()
 		return nil, err
@@ -108,68 +110,144 @@ type stagedManifest struct {
 // manifests in an order safe to import: a packfile is thin, and `index-pack
 // --fix-thin` can only complete it once the objects it deltas against are
 // already in the store, so bases come before the packs cut against them.
-func manifestOrder(ctx context.Context, client *oci.Client, entries []oci.RefEntry) ([]stagedManifest, error) {
+//
+// That is a topological order, and it is produced as one: a depth-first walk
+// that lists a manifest only after everything it was packed against. The
+// breadth-first levels this replaced were not -- a tip that is also another
+// tip's base sat in the first level with it, and the order within a level was
+// whatever the map iteration gave -- so a merge whose branch was also pushed
+// as a ref imported the merge first, half the time, and index-pack refused it.
+func manifestOrder(ctx context.Context, client *oci.Client, refs map[string]oci.RefEntry) ([]stagedManifest, error) {
 	chain, _ := client.FetchPackChain(ctx)
 
-	seen := map[string]bool{}
-	var levels [][]string
-	var frontier []string
-	for _, entry := range entries {
-		sha := entry.SHA
-		if entry.TagObject != "" {
-			sha = entry.TagObject
-		}
-		if sha == "" || seen[sha] {
+	// A tip is addressed by its commit manifest, which carries the same
+	// layers as the ref manifest (§5) and is what every base points at. An
+	// annotated tag is the exception: its packfile holds the tag object, and
+	// only the ref manifest describes that one -- nothing is tagged with the
+	// tag object's id, so asking for it by that id finds nothing. Those start
+	// from the ref manifest, the way a fetch does.
+	type tip struct{ key, chainKey string }
+	var tips []tip
+	seenTip := map[string]bool{}
+	for refName, entry := range refs {
+		if entry.SHA == "" {
 			continue
 		}
-		seen[sha] = true
-		frontier = append(frontier, sha)
+		start := tip{key: entry.SHA, chainKey: entry.SHA}
+		if entry.TagObject != "" {
+			start.key = refKeyPrefix + refName
+		}
+		if seenTip[start.key] {
+			continue
+		}
+		seenTip[start.key] = true
+		tips = append(tips, start)
 	}
+	// Sorted so the same repository hydrates the same way twice, which is worth
+	// having when an import fails and the run has to be understood.
+	sort.Slice(tips, func(i, j int) bool { return tips[i].key < tips[j].key })
 
-	resolved := map[string]*ocispec.Manifest{}
-	for len(frontier) > 0 {
-		levels = append(levels, frontier)
-		var next []string
-		for _, sha := range frontier {
-			manifest, err := client.FetchManifest(ctx, sha)
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch the manifest for %s: %w", short(sha), err)
-			}
-			resolved[sha] = manifest
+	const (
+		unvisited = iota
+		visiting
+		done
+	)
+	state := map[string]int{}
+	var order []stagedManifest
 
-			bases, err := oci.ParsePackBases(manifest.Annotations)
-			if err != nil {
-				return nil, fmt.Errorf("commit %s: %w", short(sha), err)
-			}
-			// The published chain (§6.1) is only a shortcut for discovering the
-			// graph in fewer round trips; the annotation above is what decides
-			// what has to be imported, so anything the chain adds beyond it is
-			// extra history rather than a correction.
-			for _, base := range append(bases, chain[sha]...) {
-				if seen[base] {
-					continue
-				}
-				seen[base] = true
-				next = append(next, base)
+	var visit func(key, chainKey string, path []string) error
+	visit = func(key, chainKey string, path []string) error {
+		switch state[key] {
+		case done:
+			return nil
+		case visiting:
+			// Registry content is untrusted and nothing validates the graph,
+			// so a cycle is something a reader has to survive rather than
+			// recurse into.
+			return fmt.Errorf("pack bases form a cycle: %s -> %s",
+				strings.Join(shorten(path), " -> "), short(key))
+		}
+		state[key] = visiting
+
+		manifest, err := fetchStagedManifest(ctx, client, key)
+		if err != nil {
+			return err
+		}
+		bases, err := oci.ParsePackBases(manifest.Annotations)
+		if err != nil {
+			return fmt.Errorf("%s: %w", short(key), err)
+		}
+		// The published chain (§6.1) is only a shortcut for discovering the
+		// graph in fewer round trips; the annotation above is what decides
+		// what has to be imported, so anything the chain adds beyond it is
+		// extra history rather than a correction.
+		for _, base := range append(bases, chain[chainKey]...) {
+			if err := visit(base, base, append(path, key)); err != nil {
+				return err
 			}
 		}
-		frontier = next
+
+		state[key] = done
+		order = append(order, stagedManifest{sha: key, manifest: manifest})
+		return nil
 	}
 
-	// Deepest level first: those packs depend on nothing still to come.
-	var order []stagedManifest
-	for i := len(levels) - 1; i >= 0; i-- {
-		for _, sha := range levels[i] {
-			order = append(order, stagedManifest{sha: sha, manifest: resolved[sha]})
+	for _, start := range tips {
+		if err := visit(start.key, start.chainKey, nil); err != nil {
+			return nil, err
 		}
 	}
 	return order, nil
 }
 
+// refKeyPrefix marks a manifest addressed by ref name rather than commit id in
+// the hydration walk.
+const refKeyPrefix = "ref:"
+
+// fetchStagedManifest reads the manifest a hydration key names: a ref manifest
+// for a ref-prefixed key, the commit manifest otherwise.
+func fetchStagedManifest(ctx context.Context, client *oci.Client, key string) (*ocispec.Manifest, error) {
+	refName, isRef := strings.CutPrefix(key, refKeyPrefix)
+	if !isRef {
+		manifest, err := client.FetchManifest(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch the manifest for %s: %w", short(key), err)
+		}
+		return manifest, nil
+	}
+	desc, err := client.ResolveRefManifest(ctx, refName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve the ref manifest for %s: %w", refName, err)
+	}
+	manifest, err := client.FetchManifest(ctx, desc.Digest.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the ref manifest for %s: %w", refName, err)
+	}
+	return manifest, nil
+}
+
+// shorten abbreviates each id in a path for a message.
+func shorten(path []string) []string {
+	out := make([]string, 0, len(path))
+	for _, sha := range path {
+		out = append(out, short(sha))
+	}
+	return out
+}
+
 // missingLocally reports which of the given refs the repository cannot repack
-// from its own objects.
-func missingLocally(repo *git.Repository, refs map[string]oci.RefEntry) []string {
-	if repo == nil {
+// from its own objects, and why.
+//
+// Having the tip commit is not enough. A shallow clone has every tip and none
+// of the history behind the boundary, and `git pack-objects` stops at that
+// boundary without a word -- so a consolidated pack built from one is a
+// truncated pack that looks complete, and the pruning that follows deletes the
+// only copies of what it left out. A partial clone is the same hazard with a
+// different shape: any object may be missing until it is asked for. Neither
+// can be trusted to hold a ref's whole history, so from either every ref is
+// treated as absent and the history comes from the registry, which has it.
+func missingLocally(repo *git.Repository, refs map[string]oci.RefEntry) (missing []string, why string) {
+	everything := func() []string {
 		names := make([]string, 0, len(refs))
 		for name, entry := range refs {
 			if entry.SHA != "" {
@@ -179,7 +257,15 @@ func missingLocally(repo *git.Repository, refs map[string]oci.RefEntry) []string
 		return names
 	}
 
-	var missing []string
+	switch {
+	case repo == nil:
+		return everything(), "no local repository"
+	case repo.IsShallow():
+		return everything(), "the local repository is a shallow clone, whose history is truncated"
+	case repo.IsPartial():
+		return everything(), "the local repository is a partial clone, which may be missing objects"
+	}
+
 	for name, entry := range refs {
 		if entry.SHA == "" {
 			continue
@@ -188,5 +274,5 @@ func missingLocally(repo *git.Repository, refs map[string]oci.RefEntry) []string
 			missing = append(missing, name)
 		}
 	}
-	return missing
+	return missing, "their tips are not in the local repository"
 }

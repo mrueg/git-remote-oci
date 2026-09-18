@@ -11,11 +11,7 @@ import (
 )
 
 func TestAnnotatedTagPreservation(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "git-tag-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
+	tempDir := t.TempDir()
 
 	goRepo, err := gogit.PlainInit(tempDir, false)
 	if err != nil {

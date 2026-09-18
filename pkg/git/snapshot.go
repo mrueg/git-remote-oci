@@ -1,13 +1,14 @@
 package git
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
@@ -32,12 +33,12 @@ func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Has
 		return fmt.Errorf("%w: git is not on PATH", ErrSnapshotUnavailable)
 	}
 
-	gitDir, workDir := gitDirArg()
+	// The repository this one was opened on, not whatever the environment
+	// names: a scratch store is opened explicitly, and packing the ambient
+	// repository's objects from it would be the wrong repository.
+	gitDir, workDir := r.gitDir()
 
-	peeled := tip
-	if tagObj, err := r.repo.TagObject(tip); err == nil {
-		peeled = tagObj.Target
-	}
+	peeled := r.peelTag(tip)
 
 	// The commit, its tree, and everything under that tree — and nothing else.
 	// Not walking the parents is exactly the difference between this and the
@@ -57,14 +58,22 @@ func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Has
 	}
 
 	// No --thin: the result must stand on its own.
-	pack := exec.Command("git", "--git-dir="+gitDir, "pack-objects",
+	//
+	// context.Background: CreateSnapshotPackfileTo is called from pkg/helper
+	// without a context and its signature is kept. The process is bounded by
+	// the writer it feeds instead -- a closed pipe ends it.
+	var stderr boundedBuffer
+	pack := exec.CommandContext(context.Background(), "git", "--git-dir="+gitDir, "pack-objects",
 		"--stdout", "--delta-base-offset", "--quiet")
 	pack.Dir = workDir
 	pack.Stdin = strings.NewReader(ids.String())
-	pack.Stderr = io.Discard
+	pack.Stderr = &stderr
 	pack.Stdout = writer
 
 	if err := pack.Run(); err != nil {
+		if msg := stderr.String(); msg != "" {
+			return fmt.Errorf("%w: pack-objects failed: %w: %s", ErrSnapshotUnavailable, err, msg)
+		}
 		return fmt.Errorf("%w: pack-objects failed: %w", ErrSnapshotUnavailable, err)
 	}
 	return nil
@@ -80,6 +89,12 @@ func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Has
 // A tree entry that cannot be read stops the walk with an error rather than
 // being skipped: a snapshot is defined as self-contained, and one quietly
 // missing an object would produce a shallow clone that fails on checkout.
+//
+// The subtrees are read here, one by one, rather than through go-git's
+// TreeWalker. That walker turns a subtree it cannot load into the end of the
+// walk -- io.EOF, the same answer as "done" -- so a repository missing a tree
+// object produced a short snapshot that looked complete. Every subtree this
+// lists has been opened, and one that cannot be is the error it should be.
 func (r *Repository) snapshotObjects(commitHash plumbing.Hash) ([]plumbing.Hash, error) {
 	commit, err := object.GetCommit(r.storer, commitHash)
 	if err != nil {
@@ -93,21 +108,33 @@ func (r *Repository) snapshotObjects(commitHash plumbing.Hash) ([]plumbing.Hash,
 	objects := []plumbing.Hash{commitHash, tree.Hash}
 	seen := map[plumbing.Hash]bool{commitHash: true, tree.Hash: true}
 
-	walker := object.NewTreeWalker(tree, true, seen)
-	defer walker.Close()
-	for {
-		_, entry, err := walker.Next()
-		if errors.Is(err, io.EOF) {
-			break
+	pending := []*object.Tree{tree}
+	for len(pending) > 0 {
+		current := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+
+		for _, entry := range current.Entries {
+			if entry.Mode == filemode.Submodule {
+				// A gitlink names a commit in another repository. It is not
+				// an object of this one and belongs in no packfile of it.
+				continue
+			}
+			if seen[entry.Hash] {
+				continue
+			}
+			seen[entry.Hash] = true
+			objects = append(objects, entry.Hash)
+
+			if entry.Mode != filemode.Dir {
+				continue
+			}
+			subtree, err := object.GetTree(r.storer, entry.Hash)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read tree %s (%s under %s): %w",
+					entry.Hash, entry.Name, current.Hash, err)
+			}
+			pending = append(pending, subtree)
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to walk the tree of %s: %w", commitHash, err)
-		}
-		if seen[entry.Hash] {
-			continue
-		}
-		seen[entry.Hash] = true
-		objects = append(objects, entry.Hash)
 	}
 	return objects, nil
 }
