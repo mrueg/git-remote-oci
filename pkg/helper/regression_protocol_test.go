@@ -7,15 +7,16 @@ import (
 
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing/object"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
 // TestAtomicPushCanDeleteRef covers the missing delete branch in the atomic
 // path: `git push --atomic origin :branch` used to fall through to
 // ResolveRef("") and abort the entire batch.
 func TestAtomicPushCanDeleteRef(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -47,9 +48,8 @@ func TestAtomicPushCanDeleteRef(t *testing.T) {
 // deleted after a subsequent unrelated push. The _refs index is rebuilt by
 // merging in a tag enumeration, which used to re-add the deleted ref.
 func TestDeletedRefIsNotResurrected(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -85,9 +85,8 @@ func TestDeletedRefIsNotResurrected(t *testing.T) {
 // TestQuitFlushesPendingBatch verifies that a batch terminated by "quit"
 // instead of a blank line is still executed rather than silently dropped.
 func TestQuitFlushesPendingBatch(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -107,9 +106,8 @@ func TestQuitFlushesPendingBatch(t *testing.T) {
 // dumb-HTTP info/refs syntax, not remote-helper syntax; emitting it registered
 // a bogus ref named "<ref>^{}".
 func TestListEmitsNoPeelLines(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"

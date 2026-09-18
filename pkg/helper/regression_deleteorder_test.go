@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -21,9 +22,8 @@ import (
 // where it was -- and git had been told `error`, so the user was left with a
 // remote that disagreed with itself about a ref they believed still existed.
 func TestFailedDeletionKeepsRefInIndex(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -40,15 +40,13 @@ func TestFailedDeletionKeepsRefInIndex(t *testing.T) {
 	// The registry refuses the deletion outright. Not with 405, which the
 	// client treats as "deletion unsupported" and answers with a tombstone,
 	// but with a failure it has to report.
-	reg.mu.Lock()
-	reg.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodDelete {
 			w.WriteHeader(http.StatusInternalServerError)
 			return true
 		}
 		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	// main moves in the same batch, so the index *is* rewritten -- the case
 	// in which a wrongly recorded deletion would reach it.
@@ -65,9 +63,7 @@ func TestFailedDeletionKeepsRefInIndex(t *testing.T) {
 		t.Errorf("the update of main should still have gone through:\n%s", out)
 	}
 
-	reg.mu.Lock()
-	reg.intercept = nil
-	reg.mu.Unlock()
+	reg.Intercept(nil)
 
 	listOut, err := runHelper(t, registry, "list\n\n")
 	if err != nil {
@@ -90,9 +86,8 @@ func TestFailedDeletionKeepsRefInIndex(t *testing.T) {
 // deleted -- the half-applied batch --atomic exists to rule out. Deletions now
 // run only once every upload has landed.
 func TestAtomicPushKeepsDeletedRefWhenAnotherRefFails(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -115,15 +110,13 @@ func TestAtomicPushKeepsDeletedRefWhenAnotherRefFails(t *testing.T) {
 	git(t, src, "checkout", "-q", "main")
 
 	// Fail the ref manifest write for new, and nothing else.
-	reg.mu.Lock()
-	reg.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.EncodeRefTag("refs/heads/new")) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return true
 		}
 		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	out, err := runHelper(t, registry,
 		"option atomic true\nlist for-push\npush :refs/heads/old\npush refs/heads/new:refs/heads/new\n\n")
@@ -137,9 +130,7 @@ func TestAtomicPushKeepsDeletedRefWhenAnotherRefFails(t *testing.T) {
 		t.Errorf("the batch reports a ref it could not roll back, so a deletion ran before the failure:\n%s", out)
 	}
 
-	reg.mu.Lock()
-	reg.intercept = nil
-	reg.mu.Unlock()
+	reg.Intercept(nil)
 
 	got, present := refTagRevision(t, reg, "refs/heads/old")
 	if !present {

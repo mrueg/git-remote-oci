@@ -7,27 +7,26 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 // TestRefIndexDeclaresFormatVersion pins that every repository this build
 // writes says what it is.
 func TestRefIndexDeclaresFormatVersion(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	if err := client.PushRichRefIndex(context.Background(), map[string]oci.RefEntry{
 		"refs/heads/main": {SHA: "1111111111111111111111111111111111111111"},
 	}, nil); err != nil {
 		t.Fatalf("PushRichRefIndex: %v", err)
 	}
 
-	reg.mu.Lock()
-	raw := reg.manifests[oci.TagRefIndex]
-	reg.mu.Unlock()
+	raw := reg.RawManifest(t, oci.TagRefIndex)
 
 	var m ocispec.Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -59,11 +58,10 @@ func TestUnsupportedFormatVersionIsRefused(t *testing.T) {
 			name = "absent"
 		}
 		t.Run(name, func(t *testing.T) {
-			reg := newMockRegistry()
-			ts := reg.Server()
-			defer ts.Close()
+			reg := registrytest.New()
+			ts := reg.Serve(t)
 
-			client := newTestClient(t, ts.URL)
+			client := registrytest.Client(t, ts)
 			ctx := context.Background()
 			if err := client.PushRichRefIndex(ctx, map[string]oci.RefEntry{
 				"refs/heads/main": {SHA: "1111111111111111111111111111111111111111"},
@@ -73,9 +71,8 @@ func TestUnsupportedFormatVersionIsRefused(t *testing.T) {
 
 			// Rewrite the declared version, and drop _index so the fallback
 			// cannot mask the rejection.
-			reg.mu.Lock()
 			var m map[string]any
-			_ = json.Unmarshal(reg.manifests[oci.TagRefIndex], &m)
+			_ = json.Unmarshal(reg.RawManifest(t, oci.TagRefIndex), &m)
 			annotations, _ := m["annotations"].(map[string]any)
 			if version == "" {
 				delete(annotations, "io.git-remote-oci.format-version")
@@ -83,9 +80,8 @@ func TestUnsupportedFormatVersionIsRefused(t *testing.T) {
 				annotations["io.git-remote-oci.format-version"] = version
 			}
 			updated, _ := json.Marshal(m)
-			reg.manifests[oci.TagRefIndex] = updated
-			delete(reg.manifests, oci.TagOCIIndex)
-			reg.mu.Unlock()
+			reg.PutManifest(oci.TagRefIndex, updated)
+			reg.DropManifest(oci.TagOCIIndex)
 
 			client.ClearManifestCache()
 			_, err := client.FetchRichRefIndex(ctx)
@@ -166,11 +162,10 @@ func TestParsePackBasesRequiresTheAnnotation(t *testing.T) {
 // both schemes. The encoding is injective now, so there is one tag to write and
 // one to read, and nothing has to guess.
 func TestRefManifestHasExactlyOneTag(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	const (
@@ -181,9 +176,8 @@ func TestRefManifestHasExactlyOneTag(t *testing.T) {
 		t.Fatalf("PushCommitImage: %v", err)
 	}
 
-	reg.mu.Lock()
 	var refTags []string
-	for tag := range reg.manifests {
+	for _, tag := range reg.Tags() {
 		if tag == commitSHA || strings.HasPrefix(tag, "_") && (tag == oci.TagRefIndex || tag == oci.TagOCIIndex) {
 			continue
 		}
@@ -192,7 +186,6 @@ func TestRefManifestHasExactlyOneTag(t *testing.T) {
 		}
 		refTags = append(refTags, tag)
 	}
-	reg.mu.Unlock()
 
 	if len(refTags) != 1 {
 		t.Fatalf("expected exactly one ref tag, got %v", refTags)

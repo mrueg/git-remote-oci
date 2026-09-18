@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 
 	opencontainers "github.com/opencontainers/go-digest"
@@ -98,14 +99,11 @@ func TestPackChainResolvesTheGraphInOneWave(t *testing.T) {
 	}
 
 	barrier := newConcurrencyBarrier(3, 3*time.Second)
-	reg.mu.Lock()
-	reg.intercept = func(_ http.ResponseWriter, r *http.Request) bool {
-		if r.Method == http.MethodGet && commitManifestPath.MatchString(r.URL.Path) {
-			barrier.enter()
+	reg.Observe(func(method, path string) {
+		if method == http.MethodGet && commitManifestPath.MatchString(path) {
+			barrier.enter() // never answered here; the barrier only delays
 		}
-		return false // never handled here; the barrier only delays
-	}
-	reg.mu.Unlock()
+	})
 
 	parent := t.TempDir()
 	if out, err := v2run(t, parent, nil, "clone", url, "dst"); err != nil {
@@ -195,11 +193,9 @@ func v2seedSeparatePushes(t *testing.T, url string, n int) {
 }
 
 // refsManifest returns the parsed `_refs` manifest.
-func refsManifest(t *testing.T, reg *mockRegistry) ocispec.Manifest {
+func refsManifest(t *testing.T, reg *registrytest.Registry) ocispec.Manifest {
 	t.Helper()
-	reg.mu.Lock()
-	raw, ok := reg.manifests[oci.TagRefIndex]
-	reg.mu.Unlock()
+	raw, ok := reg.ManifestBytes(oci.TagRefIndex)
 	if !ok {
 		t.Fatal("no _refs manifest was ever pushed")
 	}
@@ -210,20 +206,16 @@ func refsManifest(t *testing.T, reg *mockRegistry) ocispec.Manifest {
 	return manifest
 }
 
-// packChainOf reads the published pack-base graph out of the mock registry.
-func packChainOf(t *testing.T, reg *mockRegistry) map[string][]string {
+// packChainOf reads the published pack-base graph out of the registry.
+func packChainOf(t *testing.T, reg *registrytest.Registry) map[string][]string {
 	t.Helper()
 	manifest := refsManifest(t, reg)
 	for _, layer := range manifest.Layers {
 		if layer.MediaType != oci.MediaTypePackChain {
 			continue
 		}
-		reg.mu.Lock()
-		blob := reg.blobs[layer.Digest.String()]
-		reg.mu.Unlock()
-
 		var chain map[string][]string
-		if err := json.Unmarshal(blob, &chain); err != nil {
+		if err := json.Unmarshal(reg.BlobBytes(layer.Digest.String()), &chain); err != nil {
 			t.Fatalf("the published chain is not readable: %v", err)
 		}
 		return chain
@@ -233,21 +225,15 @@ func packChainOf(t *testing.T, reg *mockRegistry) map[string][]string {
 }
 
 // stripPackChain rewrites `_refs` as a build without the chain would have.
-func stripPackChain(t *testing.T, reg *mockRegistry) {
+func stripPackChain(t *testing.T, reg *registrytest.Registry) {
 	t.Helper()
-	manifest := refsManifest(t, reg)
-	kept := manifest.Layers[:0]
-	for _, layer := range manifest.Layers {
-		if layer.MediaType != oci.MediaTypePackChain {
-			kept = append(kept, layer)
-		}
+	if err := reg.StripLayers(oci.MediaTypePackChain); err != nil {
+		t.Fatalf("StripLayers: %v", err)
 	}
-	manifest.Layers = kept
-	putRefsManifest(t, reg, manifest)
 }
 
 // corruptPackChain replaces the published chain with whatever transform returns.
-func corruptPackChain(t *testing.T, reg *mockRegistry, transform func(map[string][]string) map[string][]string) {
+func corruptPackChain(t *testing.T, reg *registrytest.Registry, transform func(map[string][]string) map[string][]string) {
 	t.Helper()
 	replacement, err := json.Marshal(transform(packChainOf(t, reg)))
 	if err != nil {
@@ -259,29 +245,17 @@ func corruptPackChain(t *testing.T, reg *mockRegistry, transform func(map[string
 		if layer.MediaType != oci.MediaTypePackChain {
 			continue
 		}
-		desc := ocispec.Descriptor{
+		manifest.Layers[i] = ocispec.Descriptor{
 			MediaType: oci.MediaTypePackChain,
-			Digest:    opencontainers.FromBytes(replacement),
+			Digest:    opencontainers.Digest(reg.PutBlob(replacement)),
 			Size:      int64(len(replacement)),
 		}
-		reg.mu.Lock()
-		reg.blobs[desc.Digest.String()] = replacement
-		reg.mu.Unlock()
-		manifest.Layers[i] = desc
-		putRefsManifest(t, reg, manifest)
+		raw, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg.PutManifest(oci.TagRefIndex, raw)
 		return
 	}
 	t.Fatal("no pack chain layer to corrupt")
-}
-
-func putRefsManifest(t *testing.T, reg *mockRegistry, manifest ocispec.Manifest) {
-	t.Helper()
-	raw, err := json.Marshal(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg.mu.Lock()
-	reg.manifests[oci.TagRefIndex] = raw
-	reg.byDigest[opencontainers.FromBytes(raw).String()] = raw
-	reg.mu.Unlock()
 }

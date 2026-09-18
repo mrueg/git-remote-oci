@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/lfs"
 )
 
@@ -79,9 +80,8 @@ func TestAtomicPushFailsWhenAnLFSUploadFails(t *testing.T) {
 		{"ordinary", "list for-push\npush refs/heads/main:refs/heads/main\n\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reg := newMockRegistry()
-			ts := reg.Server()
-			defer ts.Close()
+			reg := registrytest.New()
+			ts := reg.Serve(t)
 
 			registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 			t.Setenv("OCI_INSECURE", "1")
@@ -92,9 +92,7 @@ func TestAtomicPushFailsWhenAnLFSUploadFails(t *testing.T) {
 			payload := []byte("large binary payload that must reach the registry")
 			commitLFSPointer(t, src, "big.bin", payload)
 
-			reg.mu.Lock()
-			reg.intercept = failBlobUpload(payload)
-			reg.mu.Unlock()
+			reg.Intercept(failBlobUpload(payload))
 
 			out, err := runHelper(t, registry, tc.script)
 
@@ -115,9 +113,8 @@ func TestAtomicPushFailsWhenAnLFSUploadFails(t *testing.T) {
 // TestAtomicPushUploadsLFSObjects pins the positive case, so the fix above
 // cannot be satisfied by simply never uploading anything.
 func TestAtomicPushUploadsLFSObjects(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -133,9 +130,7 @@ func TestAtomicPushUploadsLFSObjects(t *testing.T) {
 		t.Fatalf("atomic push failed: %v (output %q)", err, out)
 	}
 
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	for _, blob := range reg.blobs {
+	for _, blob := range reg.Blobs() {
 		if bytes.Equal(blob, payload) {
 			return
 		}

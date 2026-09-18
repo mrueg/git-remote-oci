@@ -8,22 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/lfs"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
-func lfsTestClient(t *testing.T) (*oci.Client, *mockRegistry) {
+func lfsTestClient(t *testing.T) (*oci.Client, *registrytest.Registry) {
 	t.Helper()
 
-	mock := newMockRegistry()
-	server := mock.Server()
-	t.Cleanup(server.Close)
-
-	client, err := oci.NewClient(strings.TrimPrefix(server.URL, "http://")+"/test-repo", true)
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return client, mock
+	reg := registrytest.New()
+	return registrytest.Client(t, reg.Serve(t)), reg
 }
 
 // TestPushLFSLayerPublishesUnderTheObjectId checks the happy path: the layer is
@@ -75,10 +69,7 @@ func TestPushLFSLayerRejectsCorruptObject(t *testing.T) {
 	}
 
 	// Nothing may have been published under the announced digest.
-	mock.mu.Lock()
-	_, stored := mock.blobs["sha256:"+oid]
-	mock.mu.Unlock()
-	if stored {
+	if mock.HasBlob("sha256:" + oid) {
 		t.Errorf("a mismatched blob was published under sha256:%s", oid)
 	}
 }

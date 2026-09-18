@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -42,9 +43,8 @@ func TestRefEntryUnmarshalJSON(t *testing.T) {
 }
 
 func TestRichRefIndexPushFetch(t *testing.T) {
-	mock := newMockRegistry()
-	server := mock.Server()
-	defer server.Close()
+	mock := registrytest.New()
+	server := mock.Serve(t)
 
 	serverURL := strings.TrimPrefix(server.URL, "http://")
 	client, err := oci.NewClient(serverURL+"/test-org/test-repo", true)

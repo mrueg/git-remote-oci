@@ -4,24 +4,35 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
 	opencontainers "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
-// newTestClient builds a client pointed at a mock registry.
-func newTestClient(t *testing.T, serverURL string) *oci.Client {
-	t.Helper()
-
-	client, err := oci.NewClient(strings.TrimPrefix(serverURL, "http://")+"/test-repo", true)
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	return client
+// failDeletesWith makes the registry answer every manifest DELETE with status
+// from now on: 405 is how a hosted registry says deletion is disabled, and
+// anything else stands in for a transient failure rather than a policy.
+func failDeletesWith(reg *registrytest.Registry, status int) {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodDelete {
+			return false
+		}
+		if status == http.StatusMethodNotAllowed {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"errors":[{"code":"UNSUPPORTED","message":"manifest delete is disabled"}]}`))
+			return true
+		}
+		w.WriteHeader(status)
+		return true
+	})
 }
 
 // assertManifestHasLayersArray fails if the stored manifest serialises "layers"
@@ -54,11 +65,10 @@ func assertManifestHasLayersArray(t *testing.T, raw []byte, tag string) {
 }
 
 func TestRefLockManifestIsSpecConformant(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	if _, err := client.AcquireRefLock(ctx, "refs/heads/main", time.Minute); err != nil {
@@ -66,9 +76,7 @@ func TestRefLockManifestIsSpecConformant(t *testing.T) {
 	}
 
 	tag := oci.LockTag("refs/heads/main")
-	reg.mu.Lock()
-	raw, ok := reg.manifests[tag]
-	reg.mu.Unlock()
+	raw, ok := reg.ManifestBytes(tag)
 	if !ok {
 		t.Fatalf("no lock manifest stored under %q", tag)
 	}
@@ -82,34 +90,29 @@ func TestRefLockManifestIsSpecConformant(t *testing.T) {
 	if err := client.ReleaseRefLock(ctx, "refs/heads/main"); err != nil {
 		t.Fatalf("ReleaseRefLock: %v", err)
 	}
-	reg.mu.Lock()
-	raw = reg.manifests[tag]
-	reg.mu.Unlock()
+	raw = reg.RawManifest(t, tag)
 	assertManifestHasLayersArray(t, raw, tag+" (released)")
 	assertLayerBlobsPresent(t, reg, raw, tag+" (released)")
 }
 
 func TestLFSLockManifestIsSpecConformant(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	if _, err := client.AcquireLFSLock(ctx, "big/asset.bin", "tester"); err != nil {
 		t.Fatalf("AcquireLFSLock: %v", err)
 	}
 
-	reg.mu.Lock()
 	var tag string
 	var raw []byte
-	for candidate, data := range reg.manifests {
+	for _, candidate := range reg.Tags() {
 		if strings.Contains(candidate, "lfs_locks") {
-			tag, raw = candidate, data
+			tag, raw = candidate, reg.RawManifest(t, candidate)
 		}
 	}
-	reg.mu.Unlock()
 	if raw == nil {
 		t.Fatal("no LFS lock manifest was stored")
 	}
@@ -118,17 +121,15 @@ func TestLFSLockManifestIsSpecConformant(t *testing.T) {
 }
 
 // assertLayerBlobsPresent checks that every layer a manifest names exists.
-func assertLayerBlobsPresent(t *testing.T, reg *mockRegistry, raw []byte, tag string) {
+func assertLayerBlobsPresent(t *testing.T, reg *registrytest.Registry, raw []byte, tag string) {
 	t.Helper()
 
 	var m ocispec.Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatalf("unmarshal %q: %v", tag, err)
 	}
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
 	for _, layer := range m.Layers {
-		if _, ok := reg.blobs[layer.Digest.String()]; !ok {
+		if !reg.HasBlob(layer.Digest.String()) {
 			t.Errorf("manifest %q names layer %s, which was never uploaded", tag, layer.Digest)
 		}
 	}
@@ -148,11 +149,10 @@ func TestConfigDiffIDMatchesUncompressedLayer(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("OCI_COMPRESSION", mode)
 
-			reg := newMockRegistry()
-			ts := reg.Server()
-			defer ts.Close()
+			reg := registrytest.New()
+			ts := reg.Serve(t)
 
-			client := newTestClient(t, ts.URL)
+			client := registrytest.Client(t, ts)
 			commitSHA := "1111111111111111111111111111111111111111"
 			err := client.PushCommitStream(context.Background(), oci.CommitPush{
 				CommitSHA: commitSHA,
@@ -163,21 +163,17 @@ func TestConfigDiffIDMatchesUncompressedLayer(t *testing.T) {
 				t.Fatalf("push: %v", err)
 			}
 
-			reg.mu.Lock()
-			raw := reg.manifests[commitSHA]
-			reg.mu.Unlock()
+			raw := reg.RawManifest(t, commitSHA)
 
 			var m ocispec.Manifest
 			if err := json.Unmarshal(raw, &m); err != nil {
 				t.Fatalf("unmarshal commit manifest: %v", err)
 			}
 
-			reg.mu.Lock()
-			configBytes, ok := reg.blobs[m.Config.Digest.String()]
-			reg.mu.Unlock()
-			if !ok {
+			if !reg.HasBlob(m.Config.Digest.String()) {
 				t.Fatal("config blob was not uploaded")
 			}
+			configBytes := reg.BlobBytes(m.Config.Digest.String())
 
 			var cfg ocispec.Image
 			if err := json.Unmarshal(configBytes, &cfg); err != nil {
@@ -205,11 +201,10 @@ func TestConfigDiffIDMatchesUncompressedLayer(t *testing.T) {
 // Without a platform, an entry cannot be matched by `docker pull` or any other
 // client that selects on one.
 func TestOCIImageIndexEntriesArePlatformQualified(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
-	client := newTestClient(t, ts.URL)
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	commitSHA := "2222222222222222222222222222222222222222"
@@ -222,9 +217,7 @@ func TestOCIImageIndexEntriesArePlatformQualified(t *testing.T) {
 		t.Fatalf("PushOCIImageIndex: %v", err)
 	}
 
-	reg.mu.Lock()
-	raw := reg.manifests[oci.TagOCIIndex]
-	reg.mu.Unlock()
+	raw := reg.RawManifest(t, oci.TagOCIIndex)
 
 	var idx ocispec.Index
 	if err := json.Unmarshal(raw, &idx); err != nil {

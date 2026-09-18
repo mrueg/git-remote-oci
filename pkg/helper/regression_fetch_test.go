@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/helper"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/helper"
 )
 
 // TestConcurrentFetchProducesCleanProtocolOutput drives a multi-spec fetch,
@@ -22,9 +24,8 @@ import (
 // session. Run under -race this also covers the shared Helper state those
 // workers touch.
 func TestConcurrentFetchProducesCleanProtocolOutput(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	srcDir := newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -85,19 +86,12 @@ func TestConcurrentFetchProducesCleanProtocolOutput(t *testing.T) {
 	}
 }
 
-// shaOfRef reads back the commit SHA the mock registry recorded for a ref.
-func shaOfRef(t *testing.T, reg *mockRegistry, name string) string {
+// shaOfRef reads back the commit SHA the registry recorded for a ref.
+func shaOfRef(t *testing.T, reg *registrytest.Registry, name string) string {
 	t.Helper()
 
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
-	raw, ok := reg.manifests[name]
-	if !ok {
-		t.Fatalf("mock registry has no manifest tagged %q", name)
-	}
 	var m ocispec.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal(reg.RawManifest(t, name), &m); err != nil {
 		t.Fatalf("unmarshal manifest %q: %v", name, err)
 	}
 	sha := m.Annotations[ocispec.AnnotationRevision]
@@ -119,9 +113,8 @@ func TestFetchDoesNotPullUnrequestedRefs(t *testing.T) {
 		t.Skip("git binary not available")
 	}
 
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	// Two *divergent* histories, so the commit behind one ref is not reachable
 	// from the other and cannot arrive as a side effect.

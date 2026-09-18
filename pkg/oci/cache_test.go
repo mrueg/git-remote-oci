@@ -3,17 +3,14 @@ package oci_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
-	opencontainers "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
 func TestManifestCaching(t *testing.T) {
@@ -27,27 +24,17 @@ func TestManifestCaching(t *testing.T) {
 		},
 	}
 	manifestData, _ := json.Marshal(testManifest)
-	manifestDigest := opencontainers.FromBytes(manifestData).String()
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/manifests/") {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	reg.PutManifest("v1.0.0", manifestData)
+	reg.Observe(func(_, path string) {
+		if strings.Contains(path, "/manifests/") {
 			fetchCount.Add(1)
-			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
-			w.Header().Set("Docker-Content-Digest", manifestDigest)
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(manifestData)))
-			_, _ = w.Write(manifestData)
-			return
 		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer ts.Close()
+	})
 
-	url := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
-	client, err := oci.NewClient(url, true)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-
+	client := registrytest.Client(t, ts)
 	ctx := context.Background()
 
 	// 1. Initial fetch (cache miss -> network fetch)

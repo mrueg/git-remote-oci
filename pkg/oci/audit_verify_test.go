@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -132,20 +131,19 @@ func TestManifestFetchedByDigestIsVerified(t *testing.T) {
 	served.Annotations = map[string]string{ocispec.AnnotationRevision: "0000000000000000000000000000000000000000"}
 	servedBytes, _ := json.Marshal(served)
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+	// The shared fake addresses a manifest by the digest of what it holds, so
+	// serving the wrong bytes under the right digest has to be done by hand.
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if !strings.HasSuffix(r.URL.Path, "/manifests/"+claimed.String()) {
-			w.WriteHeader(http.StatusNotFound)
-			return
+			return false
 		}
 		w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
 		w.Header().Set("Docker-Content-Digest", claimed.String())
 		_, _ = w.Write(servedBytes)
-	}))
-	defer ts.Close()
+		return true
+	})
 
 	client := registrytest.Client(t, ts)
 	m, err := client.FetchManifest(context.Background(), claimed.String())

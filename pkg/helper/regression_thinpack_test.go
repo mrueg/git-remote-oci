@@ -7,15 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 )
 
 // blobBytesStored sums the packfile blobs the registry holds.
-func blobBytesStored(reg *mockRegistry) int {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
+func blobBytesStored(reg *registrytest.Registry) int {
 	total := 0
-	for _, b := range reg.blobs {
+	for _, b := range reg.Blobs() {
 		total += len(b)
 	}
 	return total
@@ -40,9 +39,8 @@ func bigFile(seed uint64, size int) []byte {
 // and it is safe precisely because pack-bases guarantees the reader has already
 // imported those bases before this pack is indexed.
 func TestThinPacksDeltaAgainstTheirBases(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")

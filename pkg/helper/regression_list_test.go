@@ -3,7 +3,6 @@ package helper_test
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,8 @@ import (
 
 	gogit "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing/object"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/helper"
 )
 
@@ -72,14 +73,15 @@ func TestListFailsLoudlyWhenRegistryUnreachable(t *testing.T) {
 		{"forbidden", http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reg := registrytest.New()
+			ts := reg.Serve(t)
+			reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 				if r.URL.Path == "/v2/" {
-					w.WriteHeader(http.StatusOK)
-					return
+					return false
 				}
 				w.WriteHeader(tc.status)
-			}))
-			defer ts.Close()
+				return true
+			})
 
 			newCommitRepo(t)
 			registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -100,15 +102,8 @@ func TestListFailsLoudlyWhenRegistryUnreachable(t *testing.T) {
 // genuinely has nothing must still list cleanly, otherwise the very first push
 // to a new repository would fail.
 func TestListReportsEmptyForFreshRepository(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v2/" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		// A repository that has never been pushed to: everything 404s.
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer ts.Close()
+	// A repository that has never been pushed to: everything 404s.
+	ts := registrytest.New().Serve(t)
 
 	newCommitRepo(t)
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
@@ -131,9 +126,8 @@ func TestListReportsEmptyForFreshRepository(t *testing.T) {
 // the fix, the dry-run failure branch called mu.Unlock() unconditionally even
 // though single-spec pushes pass a nil mutex.
 func TestDryRunSingleSpecPackfileFailureDoesNotPanic(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	dir := newCommitRepo(t)
 

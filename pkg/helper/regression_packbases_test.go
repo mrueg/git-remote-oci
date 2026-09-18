@@ -8,8 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrueg/git-remote-oci/pkg/oci"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 // git runs a git command in dir and fails the test if it does not succeed.
@@ -108,19 +110,12 @@ func assertComplete(t *testing.T, gitDir, sha string) {
 	}
 }
 
-// packBasesOf reads the pack-bases annotation off a tag in the mock registry.
-func packBasesOf(t *testing.T, reg *mockRegistry, tag string) (string, bool) {
+// packBasesOf reads the pack-bases annotation off a tag in the registry.
+func packBasesOf(t *testing.T, reg *registrytest.Registry, tag string) (string, bool) {
 	t.Helper()
 
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
-	raw, ok := reg.manifests[tag]
-	if !ok {
-		t.Fatalf("mock registry has no manifest tagged %q", tag)
-	}
 	var m ocispec.Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal(reg.RawManifest(t, tag), &m); err != nil {
 		t.Fatalf("unmarshal manifest %q: %v", tag, err)
 	}
 	v, present := m.Annotations[oci.AnnotationGitPackBases]
@@ -141,9 +136,8 @@ func packBasesOf(t *testing.T, reg *mockRegistry, tag string) (string, bool) {
 // The shape matters: one commit per push, which is what every other test does,
 // makes each parent a previous tip and hides the bug entirely.
 func TestMultiCommitPushCloneHasFullHistory(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -203,9 +197,8 @@ func gitOutput(t *testing.T, gitDir string, args ...string) string {
 
 // TestPushRecordsPackBases pins the annotation that fetch depends on.
 func TestPushRecordsPackBases(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -248,9 +241,8 @@ func TestPushRecordsPackBases(t *testing.T) {
 func TestFetchFailsWhenBaseManifestMissing(t *testing.T) {
 	for _, verbosity := range []string{"1", "0"} {
 		t.Run("verbosity"+verbosity, func(t *testing.T) {
-			reg := newMockRegistry()
-			ts := reg.Server()
-			defer ts.Close()
+			reg := registrytest.New()
+			ts := reg.Serve(t)
 
 			registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 			t.Setenv("OCI_INSECURE", "1")
@@ -268,9 +260,7 @@ func TestFetchFailsWhenBaseManifestMissing(t *testing.T) {
 			}
 
 			// Delete the base the second packfile was cut against.
-			reg.mu.Lock()
-			delete(reg.manifests, base)
-			reg.mu.Unlock()
+			reg.DropManifest(base)
 
 			dst := newBareRepo(t)
 			t.Setenv("GIT_DIR", dst)
@@ -292,9 +282,8 @@ func TestFetchFailsWhenBaseManifestMissing(t *testing.T) {
 // ancestor of the new one, so the packfile excluded objects that no manifest
 // reachable from the new tip provides.
 func TestForcePushProducesFetchableHistory(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -338,9 +327,8 @@ func TestForcePushProducesFetchableHistory(t *testing.T) {
 // one branch excluded objects reachable from an unrelated branch that happened
 // to be on the remote, and a single-branch clone never received them.
 func TestAtomicPushOfSecondBranchIsSelfSufficient(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")

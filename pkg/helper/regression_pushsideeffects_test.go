@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrueg/git-remote-oci/internal/registrytest"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
@@ -20,13 +21,10 @@ func seedPush(t *testing.T, registry string) {
 	}
 }
 
-// requestsMatching returns the recorded requests containing substr.
-func requestsMatching(reg *mockRegistry, substr string) []string {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
+// requestsMatching returns the requests among the given ones containing substr.
+func requestsMatching(requests []string, substr string) []string {
 	var hits []string
-	for _, req := range reg.requests {
+	for _, req := range requests {
 		if strings.Contains(req, substr) {
 			hits = append(hits, req)
 		}
@@ -40,9 +38,8 @@ func requestsMatching(reg *mockRegistry, substr string) []string {
 // so `git push --dry-run origin :branch` really deleted the branch and the
 // underlying OCI manifest. The atomic path already got this right.
 func TestDryRunDoesNotDeleteRemoteRef(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -51,9 +48,7 @@ func TestDryRunDoesNotDeleteRemoteRef(t *testing.T) {
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
 	seedPush(t, registry)
 
-	reg.mu.Lock()
-	reg.requests = nil
-	reg.mu.Unlock()
+	mark := len(reg.Requests())
 
 	out, err := runHelper(t, registry, "option dry-run true\nlist for-push\npush :refs/heads/main\n\n")
 	if err != nil {
@@ -63,7 +58,7 @@ func TestDryRunDoesNotDeleteRemoteRef(t *testing.T) {
 		t.Errorf("dry-run delete should report success, got:\n%s", out)
 	}
 
-	if deletes := requestsMatching(reg, "DELETE "); len(deletes) > 0 {
+	if deletes := requestsMatching(reg.Requests()[mark:], "DELETE "); len(deletes) > 0 {
 		t.Errorf("dry-run issued %d DELETE request(s): %v", len(deletes), deletes)
 	}
 
@@ -83,9 +78,8 @@ func TestDryRunDoesNotDeleteRemoteRef(t *testing.T) {
 // batch: it takes the index lock, pushes blobs and pushes a manifest, none of
 // which belongs in a dry run.
 func TestDryRunDoesNotRewriteRefsIndex(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -94,10 +88,8 @@ func TestDryRunDoesNotRewriteRefsIndex(t *testing.T) {
 	t.Setenv("GIT_DIR", filepath.Join(src, ".git"))
 	seedPush(t, registry)
 
-	reg.mu.Lock()
-	before := string(reg.manifests[oci.TagRefIndex])
-	reg.requests = nil
-	reg.mu.Unlock()
+	before := string(reg.RawManifest(t, oci.TagRefIndex))
+	mark := len(reg.Requests())
 
 	commitFile(t, src, "second.txt", "second\n", "commit two")
 	out, err := runHelper(t, registry, "option dry-run true\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
@@ -108,15 +100,13 @@ func TestDryRunDoesNotRewriteRefsIndex(t *testing.T) {
 		t.Errorf("dry-run push should report success, got:\n%s", out)
 	}
 
-	for _, req := range requestsMatching(reg, "/manifests/") {
+	for _, req := range requestsMatching(reg.Requests()[mark:], "/manifests/") {
 		if strings.HasPrefix(req, "PUT ") {
 			t.Errorf("dry-run wrote a manifest: %s", req)
 		}
 	}
 
-	reg.mu.Lock()
-	after := string(reg.manifests[oci.TagRefIndex])
-	reg.mu.Unlock()
+	after := string(reg.RawManifest(t, oci.TagRefIndex))
 	if before != after {
 		t.Error("dry-run rewrote the _refs index")
 	}
@@ -131,9 +121,8 @@ func TestDryRunDoesNotRewriteRefsIndex(t *testing.T) {
 // while git recorded the push as done - and the next push then made its
 // fast-forward and force-with-lease decisions from the stale value.
 func TestPushReportsErrorWhenRefsIndexUpdateFails(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -145,15 +134,13 @@ func TestPushReportsErrorWhenRefsIndexUpdateFails(t *testing.T) {
 	// Fail only the index write, leaving the commit and ref manifests to land
 	// normally, which is exactly the partial-failure shape that used to be
 	// reported as success.
-	reg.mu.Lock()
-	reg.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+	reg.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/manifests/"+oci.TagRefIndex) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return true
 		}
 		return false
-	}
-	reg.mu.Unlock()
+	})
 
 	commitFile(t, src, "second.txt", "second\n", "commit two")
 	out, err := runHelper(t, registry, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
@@ -176,9 +163,8 @@ func TestPushReportsErrorWhenRefsIndexUpdateFails(t *testing.T) {
 // unlocked ref and both went ahead, so the lock constrained nothing except
 // other --atomic pushers.
 func TestNonAtomicPushAcquiresRefLock(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
@@ -211,9 +197,7 @@ func TestNonAtomicPushAcquiresRefLock(t *testing.T) {
 		t.Fatalf("ReleaseRefLock: %v", err)
 	}
 
-	reg.mu.Lock()
-	reg.requests = nil
-	reg.mu.Unlock()
+	mark := len(reg.Requests())
 
 	out, err = runHelper(t, registry, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
 	if err != nil {
@@ -229,7 +213,7 @@ func TestNonAtomicPushAcquiresRefLock(t *testing.T) {
 	// as a write to the ref's lock tag.
 	lockTag := oci.LockTag("refs/heads/main")
 	var acquired bool
-	for _, req := range requestsMatching(reg, "/manifests/"+lockTag) {
+	for _, req := range requestsMatching(reg.Requests()[mark:], "/manifests/"+lockTag) {
 		if strings.HasPrefix(req, "PUT ") {
 			acquired = true
 			break
@@ -243,9 +227,8 @@ func TestNonAtomicPushAcquiresRefLock(t *testing.T) {
 // TestPushReleasesRefLockOnFailure checks that a refused push does not strand
 // the lock it took.
 func TestPushReleasesRefLockOnFailure(t *testing.T) {
-	reg := newMockRegistry()
-	ts := reg.Server()
-	defer ts.Close()
+	reg := registrytest.New()
+	ts := reg.Serve(t)
 
 	registry := strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
 	t.Setenv("OCI_INSECURE", "1")
