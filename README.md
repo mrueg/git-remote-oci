@@ -87,7 +87,7 @@ Bug reports and pull requests are welcome.
 - ⚡ **`_refs` Index**: Fast reference lookup and listing via a consolidated `_refs` manifest tag, avoiding expensive registry tag enumeration.
 - 🛠️ **Remote Helper Options**: `followtags`, `atomic`, `cas` (`--force-with-lease`), `dry-run`, `verbosity`, `progress`. See the [options table](#git-remote-helper-options) for what is honoured and what is merely accepted.
 - 🔬 **Wire protocol v2**: the helper serves git's protocol v2 over `stateless-connect`, which is what makes **partial clone** (`--filter=blob:none`) and genuinely cheap `--depth n` possible — neither can be expressed through the simple helper interface at all. On by default; `ociremote.protocolV2=false` returns to the simple path. See [Protocol v2](#protocol-v2).
-- 🧰 **Maintenance subcommands**: `gc` compacts a repository into one self-contained packfile per ref, `fsck` checks every published ref is still fetchable without downloading anything, and that the `_index` mirror still agrees with `_refs`, `set-head` shows or changes the default branch a clone checks out, `break-lock` releases a ref lock left behind by a client that died mid-push, and `lfs-lock`/`lfs-locks`/`lfs-unlock` coordinate Git LFS file locks.
+- 🧰 **Maintenance subcommands**: `gc` compacts a repository into one self-contained packfile per ref, `fsck` checks every published ref is still fetchable without downloading anything, that `_refs` agrees with the ref tags (`--repair` rebuilds it when it does not) and that the `_index` mirror still agrees with `_refs`, `set-head` shows or changes the default branch a clone checks out, `break-lock` releases a ref lock left behind by a client that died mid-push, and `lfs-lock`/`lfs-locks`/`lfs-unlock` coordinate Git LFS file locks.
 - 🚀 **Pure Go**: `go-git/v6` for packfiles and `oras-go/v2` for the registry API. No cgo. It shells out to `git` only where go-git cannot do the job — `pack-objects` (go-git's encoder cannot delta against a base it was told to exclude, which is the whole of the thin-pack saving), `index-pack`/`unpack-objects` to complete one, and `git config` for scope precedence and `includeIf`. Object lookups, path discovery and history walks are go-git. `git` must be on `PATH`.
 
 ---
@@ -340,8 +340,11 @@ Two more subcommands help when something has gone wrong:
 ```bash
 # Check every published ref is fetchable, without downloading packfiles.
 # Follows io.git-remote-oci.pack-bases exactly as a fetch does, and compares
-# the _index mirror against _refs.
+# the _refs index against the ref tags and the _index mirror against _refs.
 git-remote-oci fsck oci://ghcr.io/your-username/my-repo
+
+# The same, then rewrite _refs to agree with the ref tags.
+git-remote-oci fsck --repair oci://ghcr.io/your-username/my-repo
 
 # Release an advisory ref lock left behind by a client that died mid-push.
 git-remote-oci break-lock --force oci://ghcr.io/your-username/my-repo refs/heads/main
@@ -363,11 +366,26 @@ manifest, and has no idea a packfile is a packfile. There is no server-side
 reachability check, so this is the only way to find out that a repository has
 become unclonable short of cloning it.
 
-It also compares `_index` against `_refs`. The two are written together and
+It also compares `_refs` against the ref tags. The tags are authoritative: a
+push writes a ref's tag before it rewrites the index, and a deletion removes the
+tag before it drops the entry, so a push or deletion that died between the two
+leaves the index lagging — a branch nobody can see, a tip older than the one
+that was pushed, or a deleted ref still listed — and nothing else ever notices,
+because every ordinary read lists refs from `_refs` and never looks at a tag.
+`fsck` lists each disagreement as the change a repair would make;
+`fsck --repair` rewrites the index to agree with the tags, under the same lock
+and compare-and-swap a push uses, keeping the recorded `HEAD`, the annotated-tag
+metadata and every entry it does not touch as they were. Ref names come from
+each manifest's annotation, so a ref whose tag was truncated is recovered under
+its full name. What cannot come back is the commit author, timestamp and message
+of an entry it rebuilds: the tag does not carry them, and they are optional.
+Reach for it after an interrupted push or deletion, or when `git ls-remote`
+disagrees with what was pushed; a plain `fsck` first says whether it is needed.
+
+It compares `_index` against `_refs` as well. The two are written together and
 `_index` stands in for `_refs` when `_refs` cannot be read, so a mirror left
 behind by a half-completed push serves an outdated ref list to whoever reaches
-it — and nothing else ever notices, because every ordinary read prefers `_refs`.
-Any push rewrites it.
+it. Any push rewrites it, and so does `fsck --repair`.
 
 > Because git invokes the helper as `git-remote-oci <remote> <url>`, a git remote
 > cannot be named `gc`, `fsck`, `break-lock`, `set-head`, `lfs-lock`,

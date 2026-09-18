@@ -14,7 +14,8 @@ import (
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
-// runFsck checks that every published ref can actually be fetched.
+// runFsck checks that every published ref can actually be fetched, and that
+// the ref index agrees with the ref tags.
 //
 // A registry validates nothing. It accepts any blob and any manifest whose
 // blobs exist, and has no idea a packfile is a packfile, so the correctness of
@@ -30,8 +31,9 @@ import (
 func runFsck(ctx context.Context, env Env) error {
 	fs := flag.NewFlagSet("fsck", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
+	repair := fs.Bool("repair", false, "rewrite _refs to agree with the ref tags")
 	fs.Usage = func() {
-		diag(env.Stderr, `usage: git-remote-oci fsck <oci-url>
+		diag(env.Stderr, `usage: git-remote-oci fsck [--repair] <oci-url>
 
 Checks that every ref published in a repository is fetchable.
 
@@ -39,11 +41,16 @@ For each ref it follows io.git-remote-oci.pack-bases the way a fetch does, and
 reports any manifest that is missing, malformed, or names a base the registry
 does not serve. Nothing is downloaded and no local repository is needed.
 
-It also compares the _index mirror against _refs. The two are written together
-and stand in for each other, so a disagreement means a past write failed
-part-way and generic OCI tooling is being shown a stale ref list.
+It also compares the _refs index against the ref tags, and the _index mirror
+against _refs. The tags are authoritative: a push writes a ref's tag before the
+index and a deletion removes the tag before the entry, so after an interrupted
+push or deletion the index is what lags. Without --repair the disagreements are
+listed as the changes a repair would make; with --repair the index is rewritten
+to agree with the tags, under the index lock, keeping HEAD, the tag metadata
+and every other entry as they were, and the _index mirror is refreshed.
 
-Exits non-zero if any ref is unfetchable or the mirror has drifted.
+Exits non-zero if any ref is unfetchable, if the index has drifted and was not
+repaired, or if a repair could not be applied.
 `)
 	}
 	if err := fs.Parse(env.Args[1:]); err != nil {
@@ -59,15 +66,41 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 		return err
 	}
 
-	refs, err := client.FetchRichRefIndex(ctx)
+	// The tags decide whether the index is right, so they are read before
+	// anything is concluded from the index -- including "no refs", which an
+	// index that was never written or lost says about a repository whose tags
+	// publish plenty.
+	plan, err := client.PlanRefIndexRepair(ctx)
 	if err != nil {
-		if oci.IsNotFound(err) {
-			return printf(env.Stdout, "the repository has no refs\n")
-		}
-		return fmt.Errorf("failed to read the ref index: %w", err)
+		return fmt.Errorf("failed to compare the _refs index against the ref tags: %w", err)
 	}
-	if len(refs) == 0 {
+	refs, err := fetchRefsForFsck(ctx, client)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 && plan.Empty() {
 		return printf(env.Stdout, "the repository has no refs\n")
+	}
+
+	drifted := false
+	if !plan.Empty() || (plan.IndexAbsent && len(refs) > 0) {
+		reportRefIndexDrift(env, plan)
+		drifted = true
+	}
+
+	repaired := ""
+	if *repair && drifted {
+		applied, repairErr := client.RepairRefIndex(ctx)
+		if repairErr != nil {
+			return fmt.Errorf("the _refs index could not be repaired: %w", repairErr)
+		}
+		repaired = applied.Summary()
+		drifted = false
+		// Everything below reports the repository as it now is.
+		client.ClearManifestCache()
+		if refs, err = fetchRefsForFsck(ctx, client); err != nil {
+			return err
+		}
 	}
 
 	refNames := make([]string, 0, len(refs))
@@ -127,31 +160,97 @@ Exits non-zero if any ref is unfetchable or the mirror has drifted.
 	// stale mirror is a way to be served an outdated ref list without being
 	// told. Nothing else notices: every normal read prefers _refs and never
 	// compares the two.
-	drifted := false
+	mirrorDrifted := false
 	if drift := indexMirrorDrift(ctx, client, refs); len(drift) > 0 {
-		for _, line := range drift {
-			diag(env.Stderr, "_index mirror: %s\n", line)
+		if *repair && repaired == "" {
+			// The tags and _refs agree, so there was nothing to rebuild, but
+			// the mirror is behind. Republishing the index unchanged is how a
+			// push would rewrite it, and is the one writer there is.
+			if err := client.PushRichRefIndex(ctx, nil, nil); err != nil {
+				return fmt.Errorf("the _index mirror could not be rewritten: %w", err)
+			}
+			repaired = "_index mirror rewritten"
+			drift = indexMirrorDrift(ctx, client, refs)
 		}
-		diag(env.Stderr, "_index mirror: run any push to rewrite it\n")
-		drifted = true
-	} else if err := printf(env.Stdout, "_index mirror matches _refs\n"); err != nil {
-		return err
+		if len(drift) > 0 {
+			for _, line := range drift {
+				diag(env.Stderr, "_index mirror: %s\n", line)
+			}
+			if !*repair {
+				diag(env.Stderr, "_index mirror: run any push, or fsck --repair, to rewrite it\n")
+			}
+			mirrorDrifted = true
+		}
+	}
+	if !mirrorDrifted {
+		if err := printf(env.Stdout, "_index mirror matches _refs\n"); err != nil {
+			return err
+		}
+	}
+
+	if repaired != "" {
+		if err := printf(env.Stdout, "repaired _refs: %s\n", repaired); err != nil {
+			return err
+		}
 	}
 
 	// Reported separately, because they are different problems with different
-	// answers: an unfetchable ref is data loss, a drifted mirror is a stale
-	// view that the next push repairs.
+	// answers: an unfetchable ref is data loss, a drifted index or mirror is a
+	// stale view that a repair puts right.
 	var problems []string
 	if broken > 0 {
 		problems = append(problems, fmt.Sprintf("%d of %d refs are not fetchable", broken, len(refNames)))
 	}
 	if drifted {
+		problems = append(problems, "the _refs index has drifted from the ref tags; run fsck --repair to rebuild it")
+	}
+	if mirrorDrifted {
 		problems = append(problems, "the _index mirror has drifted from _refs")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return printf(env.Stdout, "all %d refs are fetchable\n", len(refNames))
+}
+
+// fetchRefsForFsck reads the refs a reader is served, with an absent index
+// reported as no refs rather than as a failure.
+func fetchRefsForFsck(ctx context.Context, client *oci.Client) (map[string]oci.RefEntry, error) {
+	refs, err := client.FetchRichRefIndex(ctx)
+	if err != nil {
+		if oci.IsNotFound(err) {
+			return map[string]oci.RefEntry{}, nil
+		}
+		return nil, fmt.Errorf("failed to read the ref index: %w", err)
+	}
+	return refs, nil
+}
+
+// reportRefIndexDrift lists every way the index disagrees with the tags, as
+// the change a repair makes for it.
+func reportRefIndexDrift(env Env, plan oci.RefIndexRepair) {
+	if plan.IndexAbsent {
+		diag(env.Stderr, "_refs: absent; readers are served the _index mirror or a tag enumeration, which cannot see truncated ref names\n")
+	}
+	for _, name := range sortedRefs(plan.Add) {
+		diag(env.Stderr, "_refs: %s is not listed, but its tag is live at %s; repair adds it\n", name, short(plan.Add[name].SHA))
+	}
+	for _, name := range sortedRefs(plan.Update) {
+		diag(env.Stderr, "_refs: %s is listed at a different commit than its tag, which says %s; repair updates it\n", name, short(plan.Update[name].SHA))
+	}
+	for _, name := range sortedRefs(plan.Remove) {
+		diag(env.Stderr, "_refs: %s is listed at %s, but its tag is gone or deleted; repair removes it\n", name, short(plan.Remove[name].SHA))
+	}
+}
+
+// sortedRefs returns the keys of a ref map in order, for stable output.
+func sortedRefs(refs map[string]oci.RefEntry) []string {
+	names := make([]string, 0, len(refs))
+	for name := range refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // checkRef verifies one ref the way a fetch resolves it: through the ref
