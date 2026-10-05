@@ -291,3 +291,66 @@ func TestIsShallowFromALinkedWorktree(t *testing.T) {
 		t.Error("the common directory's shallow file was not consulted from the linked worktree")
 	}
 }
+
+// TestLinkedWorktreeWithRelativePaths: `git worktree add --relative-paths`
+// (or worktree.useRelativePaths) records the links between the worktree and
+// the repository as relative paths, and marks the repository with
+// extensions.relativeWorktrees so that older gits refuse it. go-git refused
+// it too, before v6.0.0-beta.1, so OpenRepository failed in such a repository
+// and the remote helper with it.
+func TestLinkedWorktreeWithRelativePaths(t *testing.T) {
+	requireGit(t)
+	mainDir := filepath.Join(t.TempDir(), "main")
+	if err := os.MkdirAll(mainDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mainDir, "init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(mainDir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mainDir, "add", "README.md")
+	runGit(t, mainDir, "commit", "-q", "-m", "initial")
+
+	worktreeDir := filepath.Join(filepath.Dir(mainDir), "linked")
+	cmd := exec.CommandContext(t.Context(), "git", "worktree", "add", "-q", "--relative-paths", "-b", "feature", worktreeDir)
+	cmd.Dir = mainDir
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("this git cannot create a worktree with relative paths: %v\n%s", err, out)
+	}
+	if got := runGit(t, mainDir, "config", "extensions.relativeWorktrees"); got != "true" {
+		t.Fatalf("fixture error: extensions.relativeWorktrees = %q, want true", got)
+	}
+	worktreeGitDir := runGit(t, worktreeDir, "rev-parse", "--absolute-git-dir")
+
+	open := func(t *testing.T) {
+		t.Helper()
+		repo, err := git.OpenRepository()
+		if err != nil {
+			t.Fatalf("OpenRepository: %v", err)
+		}
+		if _, err := repo.ResolveRef("refs/heads/feature"); err != nil {
+			t.Errorf("the linked worktree's branch does not resolve: %v", err)
+		}
+		common, _ := git.CommonDir()
+		commonEval, _ := filepath.EvalSymlinks(common)
+		wantCommon, _ := filepath.EvalSymlinks(filepath.Join(mainDir, ".git"))
+		if commonEval != wantCommon {
+			t.Errorf("CommonDir() = %q, want %q", common, filepath.Join(mainDir, ".git"))
+		}
+	}
+
+	t.Run("GIT_DIR", func(t *testing.T) {
+		t.Setenv("GIT_DIR", worktreeGitDir)
+		open(t)
+	})
+	t.Run("from its directory", func(t *testing.T) {
+		unsetGitDir(t)
+		t.Chdir(worktreeDir)
+		open(t)
+	})
+	t.Run("main repository", func(t *testing.T) {
+		t.Setenv("GIT_DIR", filepath.Join(mainDir, ".git"))
+		open(t)
+	})
+}
