@@ -20,7 +20,7 @@ COVER_MIN   ?= 77
 # the two cannot drift; bump it here and nowhere else. govulncheck is pinned for
 # the same reason a linter is: a floating `@latest` can change what a run
 # reports without anything in the repository changing.
-GOLANGCI_LINT_VERSION ?= v2.13.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION   ?= v1.8.0
 
 .DEFAULT_GOAL := help
