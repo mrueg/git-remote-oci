@@ -1,6 +1,6 @@
 module github.com/mrueg/git-remote-oci
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/go-git/go-billy/v6 v6.0.0-beta.1

@@ -128,7 +128,7 @@ What *does* work is under [Features](#features), and the format is specified in
 ## Installation
 
 ### Prerequisites
-- Go 1.27.1 or later (see the `go` directive in `go.mod`)
+- Go 1.27.3 or later (see the `go` directive in `go.mod`)
 - `git` on your `PATH` — the helper shells out to it for `pack-objects` when pushing,
   `index-pack` and `unpack-objects` when fetching, and `git config` to read its settings
 
